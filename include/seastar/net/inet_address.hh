@@ -29,6 +29,7 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/util/std-compat.hh>
 
 namespace seastar {
 namespace net {
@@ -105,6 +106,7 @@ public:
 
 std::ostream& operator<<(std::ostream&, const inet_address&);
 std::ostream& operator<<(std::ostream&, const inet_address::family&);
+std::ostream& operator<<(std::ostream& os, const compat::optional<inet_address::family>& f);
 
 }
 }

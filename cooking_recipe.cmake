@@ -287,8 +287,8 @@ cooking_ingredient (fmt
 
 cooking_ingredient (lz4
   EXTERNAL_PROJECT_ARGS
-    URL https://github.com/lz4/lz4/archive/v1.8.0.tar.gz
-    URL_MD5 6247bf0e955899969d1600ff34baed6b
+    URL https://github.com/lz4/lz4/archive/v1.8.1.2.tar.gz
+    URL_MD5 343538e69ba752a386c669b1a28111e2
     # This is upsetting.
     BUILD_IN_SOURCE ON
     CONFIGURE_COMMAND <DISABLE>

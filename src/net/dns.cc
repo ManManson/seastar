@@ -38,14 +38,6 @@
 
 namespace seastar {
 
-std::ostream& operator<<(std::ostream& os, const compat::optional<net::inet_address::family>& f) {
-    if (f) {
-        return os << *f;
-    } else {
-        return os << "ANY";
-    }
-}
-
 static logger dns_log("dns_resolver");
 
 class ares_error_category : public std::error_category {

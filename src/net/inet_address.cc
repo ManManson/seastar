@@ -292,6 +292,15 @@ std::ostream& seastar::net::operator<<(std::ostream& os, const inet_address::fam
     return os;
 }
 
+std::ostream& seastar::net::operator<<(std::ostream& os,
+                                       const seastar::compat::optional<inet_address::family>& f) {
+    if (f) {
+        return os << *f;
+    } else {
+        return os << "ANY";
+    }
+}
+
 std::ostream& seastar::operator<<(std::ostream& os, const socket_address& a) {
     auto addr = a.addr();
     // CMH. maybe skip brackets for ipv4-mapped
