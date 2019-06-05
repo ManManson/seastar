@@ -105,14 +105,14 @@ private:
 int main(int argc, char** argv) {
     seastar::app_template app;
     auto opts_adder = app.add_options();
-    opts_adder("input", bpo::value<seastar::sstring>(), "path to the large file to be sorted")
-              ("output", bpo::value<seastar::sstring>(), "path to the sorted output file");
+    opts_adder("input", bpo::value<seastar::sstring>()->default_value("/opt/test_data/tf1"), "path to the large file to be sorted")
+              ("output", bpo::value<seastar::sstring>()->default_value("/opt/test_data/output_tf"), "path to the sorted output file");
 
     seastar::sharded<PartitionerService> partitioner;
     return app.run(argc, argv, [&] {
         return seastar::async([&] {
-            seastar::sstring input_filepath = "/opt/test_data/tf1",
-                    output_filepath = "/opt/test_data/out_tf";
+            auto& opts = app.configuration();
+            seastar::sstring const& input_filepath = opts["input"].as<seastar::sstring>();
             auto input_fd = seastar::open_file_dma(input_filepath, seastar::open_flags::ro).get0();
 
             std::uint64_t const partition_count = input_fd.size().get0() / record_size / records_per_partition;
