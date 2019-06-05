@@ -47,6 +47,9 @@ class PartitionerService {
     std::uint32_t mCurrentPartitionId;
     std::uint64_t mPartitionCount;
 
+    std::size_t mLeft;
+    std::size_t mWritePos;
+
 public:
 
     PartitionerService(seastar::file_handle fd)
@@ -59,26 +62,39 @@ public:
 
     seastar::future<> start() {
         return seastar::do_until([this] { return mCurrentPartitionId >= mPartitionCount; }, [this] {
+            mLeft = record_size * records_per_partition;
+            mWritePos = 0;
             auto const bytes_to_read = record_size * records_per_partition;
             task_logger.info("reading {} bytes from input file. Offset {}", bytes_to_read, mCurrentPartitionId * bytes_to_read);
-            return
-                mFile.dma_read<unsigned char>(mCurrentPartitionId * bytes_to_read, bytes_to_read)
-                .then([&](auto buf) {
-                    return seastar::do_with(std::move(buf), [&] (auto& buf) {
-                        return seastar::do_with(sort_raw_data(buf), [&](auto& sorted_buf) {
-                            return seastar::open_file_dma("/opt/test_data/partition" + seastar::to_sstring(mCurrentPartitionId),
-                                seastar::open_flags::create | seastar::open_flags::truncate | seastar::open_flags::wo)
-                                .then([&](seastar::file output_partition_fd) {
-                                    task_logger.info("writing to partition {}", mCurrentPartitionId);
-                                    auto prev_partition_id = mCurrentPartitionId;
-                                    mCurrentPartitionId += seastar::smp::count;
-                                    return
-                                        output_partition_fd.dma_write(0u, sorted_buf)
-                                        .then([prev_partition_id](size_t s) {
-                                            task_logger.info("successfully written {} bytes to partition {}", s, prev_partition_id);
-                                            return seastar::make_ready_future<>();
-                                    });
+            return mFile.dma_read<unsigned char>(mCurrentPartitionId * bytes_to_read, bytes_to_read)
+                .then([this](auto buf) {
+                    return create_partition(std::move(buf));
+                });
+        });
+    }
+
+private:
+
+    seastar::future<> create_partition(seastar::temporary_buffer<unsigned char> buf)
+    {
+        return seastar::do_with(std::move(buf), [&] (auto& buf) {
+            return seastar::do_with(sort_raw_data(buf), [&](auto& sorted_buf) {
+                return seastar::open_file_dma("/opt/test_data/partition" + seastar::to_sstring(mCurrentPartitionId),
+                    seastar::open_flags::create | seastar::open_flags::truncate | seastar::open_flags::wo)
+                    .then([&](seastar::file output_partition_fd) {
+                        return seastar::do_with(std::move(output_partition_fd), mCurrentPartitionId, [&](auto& output_partition_fd, auto& prev_partition_id) {
+                            task_logger.info("writing to partition {}", prev_partition_id);
+                            mCurrentPartitionId += seastar::smp::count;
+                            return seastar::do_until([this] { return mLeft == 0; }, [&] {
+                                return output_partition_fd.dma_write(mWritePos, sorted_buf)
+                                    .then([&](size_t s) {
+                                        task_logger.info("successfully written {} bytes to partition {}", s, prev_partition_id);
+                                        mWritePos += s;
+                                        mLeft -= s;
+                                        sorted_buf.erase(sorted_buf.begin(), sorted_buf.begin() + s / record_size);
+                                        return seastar::make_ready_future<>();
                                 });
+                            });
                         });
                     });
             });
