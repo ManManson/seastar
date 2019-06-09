@@ -15,11 +15,13 @@
 #include <algorithm>
 
 #include <array>
+#include <vector>
 
 namespace bpo = boost::program_options;
 
 constexpr std::size_t record_size = 4 * seastar::KB;
 using record_type = std::array<char, record_size>;
+using record_ptr_vector = std::vector<char const*>;
 
 seastar::logger task_logger("external_merge_sort");
 
@@ -30,15 +32,33 @@ struct record_compare
         return std::lexicographical_compare(lhs.data(), lhs.data() + record_size,
                                             rhs.data(), rhs.data() + record_size);
     }
+
+    bool operator ()(record_type const* lhs, record_type const* rhs) const
+    {
+        return std::lexicographical_compare(lhs->data(), lhs->data() + record_size,
+                                            rhs->data(), rhs->data() + record_size);
+    }
+
+    bool operator ()(char const* lhs, char const* rhs) const
+    {
+        return std::lexicographical_compare(lhs, lhs + record_size,
+                                            rhs, rhs + record_size);
+    }
 };
 
-seastar::future<> sort_raw_data(seastar::temporary_buffer<char>& buf)
+constexpr std::size_t align_to_record_size(std::size_t s)
 {
-    char* raw_write_ptr = buf.get_write();
-    record_type* aliased_write_ptr = reinterpret_cast< record_type* >(raw_write_ptr),
-        *aliased_end_ptr = reinterpret_cast< record_type* >(raw_write_ptr + buf.size());
-    std::sort(aliased_write_ptr, aliased_end_ptr, record_compare());
-    return seastar::make_ready_future<>();
+    return s / record_size * record_size;
+}
+
+record_ptr_vector sort_raw_data(seastar::temporary_buffer<char> const& buf)
+{
+    record_ptr_vector result;
+    result.reserve(buf.size() / record_size);
+    for(auto pos = buf.begin(), end = buf.end(); pos != end; pos += record_size)
+        result.push_back(&*pos);
+    std::sort(result.begin(), result.end(), record_compare());
+    return result;
 }
 
 class PartitionerService {
@@ -46,14 +66,22 @@ class PartitionerService {
     std::size_t mAlignedCpuMemSize;
     std::size_t mCurrentPartitionId;
     std::size_t mPartitionsCount;
+    std::size_t mOutputRecOffset;
+    std::size_t mWritePos;
+
+    seastar::temporary_buffer<char> mTempBuf;
+
+    static constexpr size_t OUT_BUF_SIZE = align_to_record_size(32 * seastar::MB);
 
 public:
 
     PartitionerService(seastar::file_handle fd, std::size_t input_fd_size, size_t cpu_memory)
         : mInputFile(fd.to_file()),
-          mAlignedCpuMemSize(cpu_memory / record_size * record_size), // align to be a multiple of `record_size`
+          mAlignedCpuMemSize(align_to_record_size(cpu_memory)), // align to be a multiple of `record_size`
           mCurrentPartitionId(seastar::engine().cpu_id()),
-          mPartitionsCount(input_fd_size / mAlignedCpuMemSize)
+          mPartitionsCount(input_fd_size / mAlignedCpuMemSize),
+          mOutputRecOffset(0u),
+          mTempBuf(OUT_BUF_SIZE)
     {}
 
     seastar::future<> stop() {
@@ -62,6 +90,8 @@ public:
 
     seastar::future<> start() {
         return seastar::do_until([this] { return mCurrentPartitionId >= mPartitionsCount; }, [this] {
+            mWritePos = 0;
+            mOutputRecOffset = 0;
             task_logger.info("reading {} bytes from input file. Offset {}", mAlignedCpuMemSize, mCurrentPartitionId * mAlignedCpuMemSize);
             return mInputFile.dma_read<char>(mCurrentPartitionId * mAlignedCpuMemSize, mAlignedCpuMemSize)
                 .then([this](auto buf) {
@@ -76,22 +106,48 @@ private:
     seastar::future<> create_initial_partition(seastar::temporary_buffer<char> buf)
     {
         return seastar::do_with(std::move(buf), [&] (auto& buf) {
-            return sort_raw_data(buf).then([&] {
-                return seastar::open_file_dma("/opt/test_data/level0-" + seastar::to_sstring(mCurrentPartitionId),
+            auto record_ptr_vector = sort_raw_data(buf);
+            return seastar::do_with(std::move(record_ptr_vector), [&] (auto& rptr_v) {
+                return seastar::open_file_dma("/opt/test_data/part" + seastar::to_sstring(mCurrentPartitionId),
                     seastar::open_flags::create | seastar::open_flags::truncate | seastar::open_flags::wo)
                     .then([&](seastar::file output_partition_fd) {
                         return seastar::do_with(std::move(output_partition_fd), mCurrentPartitionId, [&](auto& output_partition_fd, auto& prev_partition_id) {
                             task_logger.info("writing to partition {}", prev_partition_id);
                             mCurrentPartitionId += seastar::smp::count;
-                            return output_partition_fd.dma_write(0u, buf.get(), buf.size())
-                                .then([&](size_t s) {
-                                    task_logger.info("successfully written {} bytes to partition {}", s, prev_partition_id);
-                                    return seastar::make_ready_future<>();
+                            return seastar::do_until([&] { return buf.size() / record_size < mOutputRecOffset; }, [&] {
+                                return fill_output_buffer(rptr_v).then([&] {
+                                    return output_partition_fd.dma_write(mWritePos, mTempBuf.get(), OUT_BUF_SIZE)
+                                            .then([&](size_t s) {
+                                                task_logger.info("successfully written {} bytes to partition {}", s, prev_partition_id);
+                                                mWritePos += s;
+                                            });
                                 });
+                            });
                         });
-                    });
+                });
             });
         });
+    }
+
+
+    seastar::future<> fill_output_buffer(record_ptr_vector const& v)
+    {
+        static constexpr std::size_t MAX_RECORDS_TO_FILL = OUT_BUF_SIZE / record_size;
+        char* write_ptr = mTempBuf.get_write();
+        auto it = v.cbegin() + mOutputRecOffset;
+        record_ptr_vector::const_iterator end_it;
+        if(v.size() - mOutputRecOffset < MAX_RECORDS_TO_FILL)
+            end_it = v.end();
+        else
+            end_it = it + MAX_RECORDS_TO_FILL;
+        while(it != end_it)
+        {
+            std::copy(*it, *it + record_size, write_ptr);
+            write_ptr += record_size;
+            ++it;
+        }
+        mOutputRecOffset += MAX_RECORDS_TO_FILL;
+        return seastar::make_ready_future<>();
     }
 };
 
