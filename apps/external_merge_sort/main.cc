@@ -92,10 +92,10 @@ public:
         return seastar::do_until([this] { return mCurrentPartitionId >= mPartitionsCount; }, [this] {
             mWritePos = 0;
             mOutputRecOffset = 0;
-            task_logger.info("reading {} bytes from input file. Offset {}", mAlignedCpuMemSize, mCurrentPartitionId * mAlignedCpuMemSize);
+            task_logger.info("partition {}. reading {} bytes from input file. Offset {}",
+                             mCurrentPartitionId, mAlignedCpuMemSize, mCurrentPartitionId * mAlignedCpuMemSize);
             return mInputFile.dma_read<char>(mCurrentPartitionId * mAlignedCpuMemSize, mAlignedCpuMemSize)
                 .then([this](auto buf) {
-                    task_logger.info("successfully read data");
                     return create_initial_partition(std::move(buf));
                 });
         });
@@ -105,32 +105,29 @@ private:
 
     seastar::future<> create_initial_partition(seastar::temporary_buffer<char> buf)
     {
-        return seastar::do_with(std::move(buf), [&] (auto& buf) {
-            auto record_ptr_vector = sort_raw_data(buf);
-            return seastar::do_with(std::move(record_ptr_vector), [&] (auto& rptr_v) {
-                return seastar::open_file_dma("/opt/test_data/part" + seastar::to_sstring(mCurrentPartitionId),
-                    seastar::open_flags::create | seastar::open_flags::truncate | seastar::open_flags::wo)
-                    .then([&](seastar::file output_partition_fd) {
-                        return seastar::do_with(std::move(output_partition_fd), mCurrentPartitionId, [&](auto& output_partition_fd, auto& prev_partition_id) {
-                            task_logger.info("writing to partition {}", prev_partition_id);
-                            mCurrentPartitionId += seastar::smp::count;
-                            return seastar::do_until([&] { return buf.size() / record_size < mOutputRecOffset; }, [&] {
-                                return fill_output_buffer(rptr_v).then([&] {
-                                    return output_partition_fd.dma_write(mWritePos, mTempBuf.get(), OUT_BUF_SIZE)
-                                            .then([&](size_t s) {
-                                                task_logger.info("successfully written {} bytes to partition {}", s, prev_partition_id);
-                                                mWritePos += s;
-                                            });
-                                });
-                            });
+        auto rptr_vec = sort_raw_data(buf);
+        return seastar::do_with(std::move(buf), std::move(rptr_vec), [&] (auto& buf, auto& rptr_vec) {
+            return seastar::open_file_dma("/opt/test_data/part" + seastar::to_sstring(mCurrentPartitionId),
+                seastar::open_flags::create | seastar::open_flags::truncate | seastar::open_flags::wo)
+                .then([&](seastar::file output_partition_fd) {
+                    return seastar::do_with(std::move(output_partition_fd), [&](auto& output_partition_fd) {
+                        task_logger.info("writing to partition {}", mCurrentPartitionId);
+                        mCurrentPartitionId += seastar::smp::count;
+                        return seastar::do_until([&] { return buf.size() / record_size < mOutputRecOffset; }, [&] {
+                            fill_output_buffer(rptr_vec);
+                            return output_partition_fd.dma_write(mWritePos, mTempBuf.get(), OUT_BUF_SIZE)
+                                    .then([&](size_t s) {
+                                        task_logger.info("successfully written {} bytes to partition", s);
+                                        mWritePos += s;
+                                    });
                         });
+                    });
                 });
-            });
         });
     }
 
 
-    seastar::future<> fill_output_buffer(record_ptr_vector const& v)
+    void fill_output_buffer(record_ptr_vector const& v)
     {
         static constexpr std::size_t MAX_RECORDS_TO_FILL = OUT_BUF_SIZE / record_size;
         char* write_ptr = mTempBuf.get_write();
@@ -147,7 +144,6 @@ private:
             ++it;
         }
         mOutputRecOffset += MAX_RECORDS_TO_FILL;
-        return seastar::make_ready_future<>();
     }
 };
 
