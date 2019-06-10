@@ -20,25 +20,12 @@
 namespace bpo = boost::program_options;
 
 constexpr std::size_t record_size = 4 * seastar::KB;
-using record_type = std::array<char, record_size>;
 using record_ptr_vector = std::vector<char const*>;
 
 seastar::logger task_logger("external_merge_sort");
 
 struct record_compare
 {
-    bool operator ()(record_type const& lhs, record_type const& rhs) const
-    {
-        return std::lexicographical_compare(lhs.data(), lhs.data() + record_size,
-                                            rhs.data(), rhs.data() + record_size);
-    }
-
-    bool operator ()(record_type const* lhs, record_type const* rhs) const
-    {
-        return std::lexicographical_compare(lhs->data(), lhs->data() + record_size,
-                                            rhs->data(), rhs->data() + record_size);
-    }
-
     bool operator ()(char const* lhs, char const* rhs) const
     {
         return std::lexicographical_compare(lhs, lhs + record_size,
@@ -66,12 +53,12 @@ class PartitionerService {
     std::size_t mAlignedCpuMemSize;
     std::size_t mCurrentPartitionId;
     std::size_t mPartitionsCount;
-    std::size_t mOutputRecOffset;
     std::size_t mWritePos;
 
     seastar::temporary_buffer<char> mTempBuf;
+    record_ptr_vector::const_iterator mInBufferSliceIt;
 
-    static constexpr size_t OUT_BUF_SIZE = align_to_record_size(32 * seastar::MB);
+    static constexpr size_t OUT_BUF_SIZE = align_to_record_size(16 * seastar::MB);
 
 public:
 
@@ -80,7 +67,6 @@ public:
           mAlignedCpuMemSize(align_to_record_size(cpu_memory)), // align to be a multiple of `record_size`
           mCurrentPartitionId(seastar::engine().cpu_id()),
           mPartitionsCount(input_fd_size / mAlignedCpuMemSize),
-          mOutputRecOffset(0u),
           mTempBuf(OUT_BUF_SIZE)
     {}
 
@@ -91,7 +77,6 @@ public:
     seastar::future<> start() {
         return seastar::do_until([this] { return mCurrentPartitionId >= mPartitionsCount; }, [this] {
             mWritePos = 0;
-            mOutputRecOffset = 0;
             task_logger.info("partition {}. reading {} bytes from input file. Offset {}",
                              mCurrentPartitionId, mAlignedCpuMemSize, mCurrentPartitionId * mAlignedCpuMemSize);
             return mInputFile.dma_read<char>(mCurrentPartitionId * mAlignedCpuMemSize, mAlignedCpuMemSize)
@@ -106,6 +91,7 @@ private:
     seastar::future<> create_initial_partition(seastar::temporary_buffer<char> buf)
     {
         auto rptr_vec = sort_raw_data(buf);
+        mInBufferSliceIt = rptr_vec.cbegin();
         return seastar::do_with(std::move(buf), std::move(rptr_vec), [&] (auto& buf, auto& rptr_vec) {
             return seastar::open_file_dma("/opt/test_data/part" + seastar::to_sstring(mCurrentPartitionId),
                 seastar::open_flags::create | seastar::open_flags::truncate | seastar::open_flags::wo)
@@ -113,9 +99,9 @@ private:
                     return seastar::do_with(std::move(output_partition_fd), [&](auto& output_partition_fd) {
                         task_logger.info("writing to partition {}", mCurrentPartitionId);
                         mCurrentPartitionId += seastar::smp::count;
-                        return seastar::do_until([&] { return buf.size() / record_size < mOutputRecOffset; }, [&] {
-                            fill_output_buffer(rptr_vec);
-                            return output_partition_fd.dma_write(mWritePos, mTempBuf.get(), OUT_BUF_SIZE)
+                        return seastar::do_until([&] { return mInBufferSliceIt == rptr_vec.cend(); }, [&] {
+                            auto actual_size = fill_output_buffer(rptr_vec);
+                            return output_partition_fd.dma_write(mWritePos, mTempBuf.get(), actual_size)
                                     .then([&](size_t s) {
                                         task_logger.info("successfully written {} bytes to partition", s);
                                         mWritePos += s;
@@ -127,23 +113,35 @@ private:
     }
 
 
-    void fill_output_buffer(record_ptr_vector const& v)
+    size_t fill_output_buffer(record_ptr_vector const& v)
     {
         static constexpr std::size_t MAX_RECORDS_TO_FILL = OUT_BUF_SIZE / record_size;
+
         char* write_ptr = mTempBuf.get_write();
-        auto it = v.cbegin() + mOutputRecOffset;
+
+        std::size_t slice_size;
+        auto distance_to_end = static_cast<size_t>(std::distance(mInBufferSliceIt, v.cend()));
         record_ptr_vector::const_iterator end_it;
-        if(v.size() - mOutputRecOffset < MAX_RECORDS_TO_FILL)
-            end_it = v.end();
-        else
-            end_it = it + MAX_RECORDS_TO_FILL;
-        while(it != end_it)
+        if(distance_to_end < MAX_RECORDS_TO_FILL)
         {
-            std::copy(*it, *it + record_size, write_ptr);
-            write_ptr += record_size;
-            ++it;
+            end_it = v.cend();
+            slice_size = distance_to_end * record_size;
         }
-        mOutputRecOffset += MAX_RECORDS_TO_FILL;
+        else
+        {
+            end_it = mInBufferSliceIt + MAX_RECORDS_TO_FILL;
+            slice_size = MAX_RECORDS_TO_FILL * record_size;
+        }
+        while(mInBufferSliceIt != end_it)
+        {
+            std::copy(*mInBufferSliceIt, *mInBufferSliceIt + record_size, write_ptr);
+            write_ptr += record_size;
+            ++mInBufferSliceIt;
+        }
+        if(mInBufferSliceIt != v.cend())
+            ++mInBufferSliceIt;
+
+        return slice_size;
     }
 };
 
