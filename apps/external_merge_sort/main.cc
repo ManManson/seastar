@@ -138,9 +138,6 @@ private:
             write_ptr += record_size;
             ++mInBufferSliceIt;
         }
-        if(mInBufferSliceIt != v.cend())
-            ++mInBufferSliceIt;
-
         return slice_size;
     }
 };
