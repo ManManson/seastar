@@ -11,15 +11,18 @@
 
 #include <fmt/printf.h>
 #include <boost/range/irange.hpp>
+#include <boost/iterator/counting_iterator.hpp>
 
 #include <algorithm>
 
 #include <array>
 #include <vector>
+#include <set>
+#include <queue>
 
 namespace bpo = boost::program_options;
 
-constexpr std::size_t record_size = 4 * seastar::KB;
+constexpr std::size_t RECORD_SIZE = 4 * seastar::KB;
 using record_ptr_vector = std::vector<char const*>;
 
 seastar::logger task_logger("external_merge_sort");
@@ -28,21 +31,21 @@ struct record_compare
 {
     bool operator ()(char const* lhs, char const* rhs) const
     {
-        return std::lexicographical_compare(lhs, lhs + record_size,
-                                            rhs, rhs + record_size);
+        return std::lexicographical_compare(lhs, lhs + RECORD_SIZE,
+                                            rhs, rhs + RECORD_SIZE);
     }
 };
 
 constexpr std::size_t align_to_record_size(std::size_t s)
 {
-    return s / record_size * record_size;
+    return s / RECORD_SIZE * RECORD_SIZE;
 }
 
 record_ptr_vector sort_raw_data(seastar::temporary_buffer<char> const& buf)
 {
     record_ptr_vector result;
-    result.reserve(buf.size() / record_size);
-    for(auto pos = buf.begin(), end = buf.end(); pos != end; pos += record_size)
+    result.reserve(buf.size() / RECORD_SIZE);
+    for(auto pos = buf.begin(), end = buf.end(); pos != end; pos += RECORD_SIZE)
         result.push_back(&*pos);
     std::sort(result.begin(), result.end(), record_compare());
     return result;
@@ -86,6 +89,11 @@ public:
         });
     }
 
+    size_t total_partitions_count() const
+    {
+        return mPartitionsCount;
+    }
+
 private:
 
     seastar::future<> create_initial_partition(seastar::temporary_buffer<char> buf)
@@ -115,7 +123,7 @@ private:
 
     size_t fill_output_buffer(record_ptr_vector const& v)
     {
-        static constexpr std::size_t MAX_RECORDS_TO_FILL = OUT_BUF_SIZE / record_size;
+        static constexpr std::size_t MAX_RECORDS_TO_FILL = OUT_BUF_SIZE / RECORD_SIZE;
 
         char* write_ptr = mTempBuf.get_write();
 
@@ -125,22 +133,135 @@ private:
         if(distance_to_end < MAX_RECORDS_TO_FILL)
         {
             end_it = v.cend();
-            slice_size = distance_to_end * record_size;
+            slice_size = distance_to_end * RECORD_SIZE;
         }
         else
         {
             end_it = mInBufferSliceIt + MAX_RECORDS_TO_FILL;
-            slice_size = MAX_RECORDS_TO_FILL * record_size;
+            slice_size = MAX_RECORDS_TO_FILL * RECORD_SIZE;
         }
         while(mInBufferSliceIt != end_it)
         {
-            std::copy(*mInBufferSliceIt, *mInBufferSliceIt + record_size, write_ptr);
-            write_ptr += record_size;
+            std::copy(*mInBufferSliceIt, *mInBufferSliceIt + RECORD_SIZE, write_ptr);
+            write_ptr += RECORD_SIZE;
             ++mInBufferSliceIt;
         }
         return slice_size;
     }
 };
+
+struct DataFragment
+{
+    const char* mBeginPtr; // points to an array of 4K records
+    std::size_t mDataSize; // array size in bytes
+};
+
+class InitialRunReader
+{
+    static constexpr size_t BUF_SIZE = align_to_record_size(16 * seastar::MB);
+
+    seastar::file mFd;
+    seastar::temporary_buffer<char> mBuf;
+    std::size_t mActualBufSize;
+    std::size_t mCurrentReadPos = 0;
+
+public:
+
+    InitialRunReader() = default;
+
+    seastar::future<> stop() const {
+        return seastar::make_ready_future<>();
+    }
+
+    void set_file(seastar::file fd)
+    {
+        mFd = std::move(fd);
+    }
+
+    std::size_t fetch_data()
+    {
+        mBuf = mFd.dma_read<char>(mCurrentReadPos, BUF_SIZE).get0();
+        mActualBufSize = mBuf.size();
+        mCurrentReadPos += mActualBufSize;
+        return mActualBufSize;
+    }
+
+    DataFragment get_next_fragment()
+    {
+        return DataFragment{mBuf.get(), mActualBufSize};
+    }
+};
+
+void merge(unsigned initial_partition_count, seastar::sharded<InitialRunReader>& sharded_reader)
+{
+    static constexpr size_t OUT_BUF_SIZE = align_to_record_size(16 * seastar::MB);
+    auto const reader_shard_indices = boost::irange(1u, seastar::smp::count);
+
+    seastar::temporary_buffer<char> out_buf(OUT_BUF_SIZE);
+    std::size_t write_pos = 0u;
+
+    seastar::file output_file = seastar::open_file_dma("/opt/test_data/sorted",
+        seastar::open_flags::create | seastar::open_flags::truncate | seastar::open_flags::wo).get0();
+
+    sharded_reader.start().get0();
+
+    // assign unprocessed initial partition ids
+    std::queue<unsigned> unprocessed_ids;
+    for(unsigned i = 0; i != initial_partition_count; ++i) {
+        unprocessed_ids.push(i);
+    }
+
+    // open first files and fetch data
+    sharded_reader.invoke_on_others([] (InitialRunReader& r) {
+        r.set_file(seastar::open_file_dma("/opt/test_data/part" + seastar::to_sstring(seastar::engine().cpu_id()),
+            seastar::open_flags::ro).get0());
+    }).get0();
+    sharded_reader.invoke_on_others([] (InitialRunReader& r) {
+        r.fetch_data();
+    }).get0();
+
+    std::priority_queue<char const*, std::vector<char const*>, record_compare> priorq;
+
+    // while there is something to process
+    while(!unprocessed_ids.empty()) {
+        for(auto i : reader_shard_indices) {
+            DataFragment fragment = sharded_reader.invoke_on(i, [](InitialRunReader& r) {
+                return r.get_next_fragment();
+            }).get0();
+            // if there is no fragment, then it means that the file is over
+            // and we need to open a new one and fetch data afterwards
+            if(!fragment.mBeginPtr) {
+                if(unprocessed_ids.empty())
+                    break;
+                // take partition id from unprocessed queue, assign it to the shard that needs to be updated
+                unsigned part_id = unprocessed_ids.front();
+                sharded_reader.invoke_on(i, [part_id](InitialRunReader& r) {
+                    //r.set_next_file(part_id);
+                    r.fetch_data();
+                }).get0();
+                unprocessed_ids.pop();
+            }
+            // sort data locally
+            for(std::size_t fragment_pos = 0u; fragment_pos < fragment.mDataSize; fragment_pos += RECORD_SIZE) {
+                priorq.push(fragment.mBeginPtr + fragment_pos);
+            }
+            if(seastar::need_preempt())
+                seastar::thread::yield(); // yield to the reactor event loop for a while
+        }
+
+        while(!priorq.empty()) {
+            char const* rec_ptr = priorq.top();
+            std::copy(rec_ptr, rec_ptr + RECORD_SIZE, out_buf.get_write() + write_pos);
+            write_pos += RECORD_SIZE;
+            priorq.pop();
+        }
+
+        // TODO: output buffer should be checked appropriately and flushed to the output file eventually
+
+        // transfer control to reactor event loop again to prevent reactor stalls
+        seastar::thread::yield();
+    }
+}
 
 int main(int argc, char** argv) {
     seastar::app_template app;
@@ -149,6 +270,7 @@ int main(int argc, char** argv) {
               ("output", bpo::value<seastar::sstring>()->default_value("/opt/test_data/output_tf"), "path to the sorted output file");
 
     seastar::sharded<PartitionerService> partitioner;
+    seastar::sharded<InitialRunReader> sharded_reader;
     return app.run(argc, argv, [&] {
         return seastar::async([&] {
             std::size_t const available_memory = seastar::memory::stats().free_memory() / 2,
@@ -176,7 +298,8 @@ int main(int argc, char** argv) {
             }).get0();
             input_fd.close().get0();
 
-            // repeatedly invoke merge passes until there is nothing to merge
+            // invoke K-way merge sorting algorithm
+            merge(partitioner.local().total_partitions_count(), sharded_reader);
         });
     });
 }
