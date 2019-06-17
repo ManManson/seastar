@@ -270,7 +270,7 @@ void merge_pass(unsigned lvl, unsigned current_lvl_part_count, unsigned current_
                 // there we should check that is `fetch_data` failed then `continue` should be called
                 // in order to continue processing another shard
             }
-            // sort data locally
+            // sort data locally on zero-th core
             for(std::size_t fragment_pos = 0u; fragment_pos < fragment.mDataSize; fragment_pos += RECORD_SIZE) {
                 priorq.push(fragment.mBeginPtr + fragment_pos);
             }
@@ -333,6 +333,8 @@ void merge_algorithm(unsigned initial_partition_count, std::size_t input_file_si
                 unsigned id = unprocessed_ids.front();
                 assigned_ids.push_back(id);
                 unprocessed_ids.pop();
+                if(unprocessed_ids.empty())
+                    break;
             }
 
             merge_pass(lvl, current_lvl_part_count, current_part_id++,
@@ -386,7 +388,7 @@ int main(int argc, char** argv) {
             });
 
             // invoke K-way merge sorting algorithm
-            merge_algorithm(304/*partitioner.local().total_partitions_count()*/, input_size, sharded_reader, per_cpu_memory);
+            merge_algorithm(305/*partitioner.local().total_partitions_count()*/, input_size, sharded_reader, per_cpu_memory);
         });
     });
 }
