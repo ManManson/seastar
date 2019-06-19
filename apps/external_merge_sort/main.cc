@@ -139,17 +139,23 @@ private:
                                  mCurrentPartitionId);
                 mCurrentPartitionId += seastar::smp::count;
                 return seastar::do_until(
-                  [&] { return mInBufferSliceIt == rptr_vec.cend(); },
-                  [&] {
-                    auto actual_size = fill_output_buffer(rptr_vec);
-                    return output_partition_fd
-                      .dma_write(mWritePos, mTempBuf.get(), actual_size)
-                      .then([&](size_t s) {
-                        task_logger.info("successfully written {} "
-                                         "bytes to partition",
-                                         s);
-                        mWritePos += s;
-                      });
+                         [&] { return mInBufferSliceIt == rptr_vec.cend(); },
+                         [&] {
+                           auto actual_size = fill_output_buffer(rptr_vec);
+                           return output_partition_fd
+                             .dma_write(mWritePos, mTempBuf.get(), actual_size)
+                             .then([&](size_t s) {
+                               task_logger.info("successfully written {} "
+                                                "bytes to partition",
+                                                s);
+                               mWritePos += s;
+                             });
+                         })
+                  .then([&output_partition_fd] {
+                    return output_partition_fd.flush();
+                  })
+                  .then([&output_partition_fd] {
+                    return output_partition_fd.close();
                   });
               });
           });
@@ -204,7 +210,12 @@ public:
         align_to_record_size(mem)) // align to be a multiple of `record_size`
   {}
 
-  seastar::future<> stop() const { return seastar::make_ready_future<>(); }
+  seastar::future<> stop()
+  {
+    if (mFd)
+      return mFd.close();
+    return seastar::make_ready_future<>();
+  }
 
   seastar::future<> set_file(seastar::sstring filepath, seastar::file fd)
   {
@@ -222,7 +233,13 @@ public:
     });
   }
 
-  seastar::future<> remove_file() { return seastar::remove_file(mFilePath); }
+  seastar::future<> remove_file()
+  {
+    task_logger.info("removing file {}", mFilePath);
+    return mFd.close()
+      .then([&] { return seastar::remove_file(mFilePath); })
+      .then([&] { mFd = seastar::file(); });
+  }
 
   seastar::future<std::size_t> fetch_data()
   {
@@ -242,6 +259,22 @@ public:
     return DataFragment{ mBuf.get(), mActualBufSize };
   }
 };
+
+void
+write_to_file_from_buf(
+  seastar::file& output_file,
+  seastar::temporary_buffer<record_underlying_type> const& buf,
+  std::size_t buf_size,
+  std::size_t& outfile_write_pos,
+  std::size_t& buf_write_pos)
+{
+  output_file
+    .dma_write<record_underlying_type>(outfile_write_pos, buf.get(), buf_size)
+    .get0();
+  output_file.flush().get0();
+  outfile_write_pos += buf_size;
+  buf_write_pos = 0u;
+}
 
 using priority_queue_type =
   std::priority_queue<record_underlying_type const*,
@@ -294,8 +327,6 @@ merge_pass(unsigned lvl,
       sharded_reader
         .invoke_on(i,
                    [&](RunReaderService& r) {
-                     task_logger.info("fetching data on cpu_id {}",
-                                      seastar::engine().cpu_id());
                      return r.fetch_data().then([](std::size_t) {
                        return seastar::make_ready_future<>();
                      });
@@ -331,22 +362,14 @@ merge_pass(unsigned lvl,
       priorq.pop();
       // flush full output buffer contents to the output file
       if (buf_write_pos == OUT_BUF_SIZE) {
-        buf_write_pos = 0u;
-        output_file
-          .dma_write<record_underlying_type>(
-            outfile_write_pos, out_buf.get(), OUT_BUF_SIZE)
-          .get0();
-        outfile_write_pos += OUT_BUF_SIZE;
+        write_to_file_from_buf(
+          output_file, out_buf, OUT_BUF_SIZE, outfile_write_pos, buf_write_pos);
       }
     }
     // flush remaining part of the output buffer to the file
     if (buf_write_pos != 0) {
-      output_file
-        .dma_write<record_underlying_type>(
-          outfile_write_pos, out_buf.get(), buf_write_pos)
-        .get0();
-      outfile_write_pos += buf_write_pos;
-      buf_write_pos = 0u;
+      write_to_file_from_buf(
+        output_file, out_buf, buf_write_pos, outfile_write_pos, buf_write_pos);
     }
 
     // transfer control to reactor event loop to prevent reactor stalls
@@ -354,6 +377,9 @@ merge_pass(unsigned lvl,
       seastar::thread::yield();
   }
 
+  output_file.close().get0();
+
+  // remove exhausted partitions that participated in this merge operation
   seastar::parallel_for_each(
     reader_shard_indices,
     [&](unsigned i) {
