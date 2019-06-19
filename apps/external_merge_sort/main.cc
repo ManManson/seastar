@@ -192,6 +192,7 @@ struct DataFragment
 class RunReaderService
 {
   seastar::file mFd;
+  seastar::sstring mFilePath;
   seastar::temporary_buffer<record_underlying_type> mBuf;
   std::size_t mActualBufSize = 0u;
   std::size_t mCurrentReadPos = 0;
@@ -205,18 +206,23 @@ public:
 
   seastar::future<> stop() const { return seastar::make_ready_future<>(); }
 
-  seastar::future<> set_file(seastar::file fd)
+  seastar::future<> set_file(seastar::sstring filepath, seastar::file fd)
   {
     mFd = std::move(fd);
+    mFilePath = std::move(filepath);
     mCurrentReadPos = 0u;
     return seastar::make_ready_future<>();
   }
 
-  seastar::future<> open_file(seastar::sstring const& path)
+  seastar::future<> open_file(seastar::sstring path)
   {
-    return seastar::open_file_dma(path, seastar::open_flags::ro)
-      .then([&](seastar::file fd) { return set_file(std::move(fd)); });
+    return seastar::do_with(std::move(path), [&](auto& path) {
+      return seastar::open_file_dma(path, seastar::open_flags::ro)
+        .then([&](seastar::file fd) { return set_file(path, std::move(fd)); });
+    });
   }
+
+  seastar::future<> remove_file() { return seastar::remove_file(mFilePath); }
 
   seastar::future<std::size_t> fetch_data()
   {
@@ -347,6 +353,14 @@ merge_pass(unsigned lvl,
     if (seastar::need_preempt())
       seastar::thread::yield();
   }
+
+  seastar::parallel_for_each(
+    reader_shard_indices,
+    [&](unsigned i) {
+      return sharded_reader.invoke_on(
+        i, [](RunReaderService& r) { return r.remove_file(); });
+    })
+    .get0();
 }
 
 void
