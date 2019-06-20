@@ -91,7 +91,7 @@ class InitialRunService
   seastar::sstring mTempPath;
 
   static constexpr size_t OUT_BUF_SIZE =
-    align_to_record_size(64u * seastar::MB);
+    align_to_record_size(32u * seastar::MB);
 
 public:
   InitialRunService(seastar::file_handle fd,
@@ -348,6 +348,10 @@ public:
         }
 
         merge_pass(lvl, current_run_id++, assigned_ids, run_size);
+
+        // get the reactor some time after intensive work
+        if (seastar::need_preempt())
+          seastar::thread::yield();
       }
       ++lvl;
       // increase each run size by a factor of K = (smp::count - 1)
@@ -377,7 +381,7 @@ private:
                   std::size_t run_size)
   {
     static constexpr size_t OUT_BUF_SIZE =
-      align_to_record_size(64u * seastar::MB);
+      align_to_record_size(32u * seastar::MB);
     auto const reader_shard_indices =
       boost::irange(static_cast<size_t>(1u), assigned_ids.size() + 1);
 
