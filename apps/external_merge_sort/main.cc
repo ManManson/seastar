@@ -49,6 +49,12 @@ align_to_record_size(std::size_t s)
   return s / RECORD_SIZE * RECORD_SIZE;
 }
 
+constexpr std::size_t
+round_up_int_div(std::size_t num, std::size_t denom)
+{
+  return (num + denom - 1) / denom;
+}
+
 record_ptr_vector
 sort_raw_data(seastar::temporary_buffer<record_underlying_type> const& buf)
 {
@@ -74,9 +80,9 @@ class PartitionerService
 {
   seastar::file mInputFile;
   std::size_t mAlignedCpuMemSize;
-  std::size_t mCurrentPartitionId;
-  std::size_t mPartitionsCount;
-  std::size_t mWritePos;
+  uint32_t mCurrentPartitionId;
+  uint32_t mPartitionsCount;
+  uint64_t mWritePos;
 
   seastar::temporary_buffer<record_underlying_type> mTempBuf;
   record_ptr_vector::const_iterator mInBufferSliceIt;
@@ -91,8 +97,7 @@ public:
     // align to be a multiple of `record_size`
     , mAlignedCpuMemSize(align_to_record_size(cpu_memory))
     , mCurrentPartitionId(seastar::engine().cpu_id())
-    , mPartitionsCount((input_fd_size + mAlignedCpuMemSize - 1) /
-                       mAlignedCpuMemSize)
+    , mPartitionsCount(round_up_int_div(input_fd_size, mAlignedCpuMemSize))
     , mTempBuf(OUT_BUF_SIZE)
   {}
 
@@ -127,38 +132,51 @@ private:
     auto rptr_vec = sort_raw_data(buf);
     mInBufferSliceIt = rptr_vec.cbegin();
     return seastar::do_with(
-      std::move(buf), std::move(rptr_vec), [&](auto& buf, auto& rptr_vec) {
-        return seastar::open_file_dma(
-                 partition_filename(0u, mCurrentPartitionId),
-                 seastar::open_flags::create | seastar::open_flags::truncate |
-                   seastar::open_flags::wo)
-          .then([&](seastar::file output_partition_fd) {
-            return seastar::do_with(
-              std::move(output_partition_fd), [&](auto& output_partition_fd) {
-                task_logger.info("writing to partition {}",
-                                 mCurrentPartitionId);
-                mCurrentPartitionId += seastar::smp::count;
-                return seastar::do_until(
-                         [&] { return mInBufferSliceIt == rptr_vec.cend(); },
-                         [&] {
-                           auto actual_size = fill_output_buffer(rptr_vec);
-                           return output_partition_fd
-                             .dma_write(mWritePos, mTempBuf.get(), actual_size)
-                             .then([&](size_t s) {
-                               task_logger.info("successfully written {} "
-                                                "bytes to partition",
-                                                s);
-                               mWritePos += s;
-                             });
+             std::move(buf),
+             std::move(rptr_vec),
+             [&](auto& buf, auto& rptr_vec) {
+               return seastar::open_file_dma(
+                        partition_filename(0u, mCurrentPartitionId),
+                        seastar::open_flags::create |
+                          seastar::open_flags::truncate |
+                          seastar::open_flags::wo)
+                 .then([&](seastar::file output_partition_fd) {
+                   return seastar::do_with(
+                     std::move(output_partition_fd),
+                     [&](auto& output_partition_fd) {
+                       task_logger.info("writing to partition {}",
+                                        mCurrentPartitionId);
+                       mCurrentPartitionId += seastar::smp::count;
+                       return seastar::do_until(
+                                [&] {
+                                  return mInBufferSliceIt == rptr_vec.cend();
+                                },
+                                [&] {
+                                  auto actual_size =
+                                    fill_output_buffer(rptr_vec);
+                                  return output_partition_fd
+                                    .dma_write(
+                                      mWritePos, mTempBuf.get(), actual_size)
+                                    .then([&](size_t s) {
+                                      task_logger.info(
+                                        "successfully written {} "
+                                        "bytes to partition",
+                                        s);
+                                      mWritePos += s;
+                                    });
+                                })
+                         .then([&output_partition_fd] {
+                           return output_partition_fd.flush();
                          })
-                  .then([&output_partition_fd] {
-                    return output_partition_fd.flush();
-                  })
-                  .then([&output_partition_fd] {
-                    return output_partition_fd.close();
-                  });
-              });
-          });
+                         .then([&output_partition_fd] {
+                           return output_partition_fd.close();
+                         });
+                     });
+                 });
+             })
+      .handle_exception([](auto ex) {
+        task_logger.error("Exception during creation of initial partition: {}",
+                          ex);
       });
   }
 
@@ -200,8 +218,8 @@ class RunReaderService
   seastar::file mFd;
   seastar::sstring mFilePath;
   seastar::temporary_buffer<record_underlying_type> mBuf;
+  uint64_t mCurrentReadPos = 0;
   std::size_t mActualBufSize = 0u;
-  std::size_t mCurrentReadPos = 0;
   std::size_t mAlignedCpuMemSize;
 
 public:
@@ -265,8 +283,8 @@ write_to_file_from_buf(
   seastar::file& output_file,
   seastar::temporary_buffer<record_underlying_type> const& buf,
   std::size_t buf_size,
-  std::size_t& outfile_write_pos,
-  std::size_t& buf_write_pos)
+  uint64_t& outfile_write_pos,
+  uint64_t& buf_write_pos)
 {
   task_logger.info("writing {} bytes from temporary buffer to the partition",
                    buf_size);
@@ -297,7 +315,7 @@ merge_pass(unsigned lvl,
     boost::irange(static_cast<size_t>(1u), assigned_ids.size() + 1);
 
   seastar::temporary_buffer<record_underlying_type> out_buf(OUT_BUF_SIZE);
-  std::size_t buf_write_pos = 0u;
+  uint64_t buf_write_pos = 0u;
 
   seastar::file output_file =
     seastar::open_file_dma(partition_filename(lvl, current_part_id),
@@ -305,7 +323,7 @@ merge_pass(unsigned lvl,
                              seastar::open_flags::truncate |
                              seastar::open_flags::wo)
       .get0();
-  std::size_t outfile_write_pos = 0u;
+  uint64_t outfile_write_pos = 0u;
 
   // open assigned file ids
   seastar::parallel_for_each(
@@ -344,7 +362,7 @@ merge_pass(unsigned lvl,
         continue;
 
       // sort data locally on zero-th core
-      for (std::size_t fragment_pos = 0u; fragment_pos < fragment.mDataSize;
+      for (uint64_t fragment_pos = 0u; fragment_pos < fragment.mDataSize;
            fragment_pos += RECORD_SIZE) {
         priorq.push(fragment.mBeginPtr + fragment_pos);
       }
@@ -402,8 +420,8 @@ merge_algorithm(unsigned initial_partition_count,
 
   std::size_t part_size = align_to_record_size(per_cpu_memory);
 
-  unsigned lvl = 1u;
-  unsigned prev_lvl_partition_count = initial_partition_count;
+  uint32_t lvl = 1u;
+  uint32_t prev_lvl_partition_count = initial_partition_count;
 
   sharded_reader.start(per_cpu_memory).get0();
 
@@ -413,8 +431,8 @@ merge_algorithm(unsigned initial_partition_count,
     task_logger.info("invoking merge pass (level {})", lvl);
 
     // assign unprocessed initial partition ids
-    std::queue<unsigned> unprocessed_ids;
-    for (unsigned i = 0; i != prev_lvl_partition_count; ++i) {
+    std::queue<uint32_t> unprocessed_ids;
+    for (uint32_t i = 0; i != prev_lvl_partition_count; ++i) {
       unprocessed_ids.push(i);
     }
 
@@ -423,10 +441,10 @@ merge_algorithm(unsigned initial_partition_count,
       // take at most K ids from unprocessed list and pass them to the merge
       // pass in the case where < K ids are available, utilize only a fraction
       // of CPUs accordingly
-      std::vector<unsigned> assigned_ids;
+      std::vector<uint32_t> assigned_ids;
       assigned_ids.reserve(K);
-      for (unsigned i = 0u; i != K; ++i) {
-        unsigned id = unprocessed_ids.front();
+      for (uint32_t i = 0u; i != K; ++i) {
+        uint32_t id = unprocessed_ids.front();
         assigned_ids.push_back(id);
         unprocessed_ids.pop();
         if (unprocessed_ids.empty())
@@ -446,7 +464,7 @@ merge_algorithm(unsigned initial_partition_count,
     // since it is the constant in K-way merge algorithm
     part_size *= K;
     part_size = align_to_record_size(part_size);
-    prev_lvl_partition_count = (input_file_size + part_size - 1) / part_size;
+    prev_lvl_partition_count = round_up_int_div(input_file_size, part_size);
   }
 
   // move last produced partition to `output_file` destination
@@ -473,6 +491,10 @@ main(int argc, char** argv)
   seastar::sharded<RunReaderService> sharded_reader;
   return app.run(argc, argv, [&] {
     return seastar::async([&] {
+      seastar::engine().at_exit([&partitioner] { return partitioner.stop(); });
+      seastar::engine().at_exit(
+        [&sharded_reader] { return sharded_reader.stop(); });
+
       std::size_t const available_memory =
                           seastar::memory::stats().free_memory() / 2,
                         per_cpu_memory = available_memory / seastar::smp::count;
@@ -488,13 +510,26 @@ main(int argc, char** argv)
       auto& opts = app.configuration();
       seastar::sstring const &input_filepath =
                                opts["input"].as<seastar::sstring>(),
-                             ouptut_filepath =
+                             output_filepath =
                                opts["output"].as<seastar::sstring>();
       auto input_fd =
         seastar::open_file_dma(input_filepath, seastar::open_flags::ro).get0();
       std::size_t const input_size = input_fd.size().get0();
 
-      seastar::engine().at_exit([&partitioner] { return partitioner.stop(); });
+      if (input_size % RECORD_SIZE) {
+        throw std::runtime_error(
+          "Input file size should be a multiple of RECORD_SIZE (4096 bytes)");
+      }
+
+      // remove output file in case it already exists
+      seastar::engine()
+        .file_exists(output_filepath)
+        .then([output_filepath](bool exists) {
+          if (exists)
+            return seastar::engine().remove_file(output_filepath);
+          return seastar::make_ready_future<>();
+        })
+        .get0();
 
       // initial partitioning pass
       seastar::do_with(
@@ -509,15 +544,12 @@ main(int argc, char** argv)
         })
         .get0();
 
-      seastar::engine().at_exit(
-        [&sharded_reader] { return sharded_reader.stop(); });
-
       // invoke K-way merge sorting algorithm
       merge_algorithm(partitioner.local().total_partitions_count(),
                       input_size,
                       sharded_reader,
                       per_cpu_memory,
-                      ouptut_filepath);
+                      output_filepath);
     });
   });
 }
