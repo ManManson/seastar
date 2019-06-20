@@ -268,6 +268,8 @@ write_to_file_from_buf(
   std::size_t& outfile_write_pos,
   std::size_t& buf_write_pos)
 {
+  task_logger.info("writing {} bytes from temporary buffer to the partition",
+                   buf_size);
   output_file
     .dma_write<record_underlying_type>(outfile_write_pos, buf.get(), buf_size)
     .get0();
@@ -323,19 +325,19 @@ merge_pass(unsigned lvl,
   // while there is something to process in at least one reader
   while (outfile_write_pos <
          part_size * assigned_ids.size()) { // part_size * <readers_count>
-    for (auto i : reader_shard_indices) {
-      sharded_reader
-        .invoke_on(i,
-                   [&](RunReaderService& r) {
-                     return r.fetch_data().then([](std::size_t) {
-                       return seastar::make_ready_future<>();
-                     });
-                   })
-        .get0();
-
+    for (auto shard_idx : reader_shard_indices) {
       DataFragment fragment =
         sharded_reader
-          .invoke_on(i, [](RunReaderService& r) { return r.data_fragment(); })
+          .invoke_on(shard_idx,
+                     [&](RunReaderService& r) {
+                       return r.fetch_data().then([](std::size_t) {
+                         return seastar::make_ready_future<>();
+                       });
+                     })
+          .then([&sharded_reader, shard_idx] {
+            return sharded_reader.invoke_on(
+              shard_idx, [](RunReaderService& r) { return r.data_fragment(); });
+          })
           .get0();
 
       if (fragment.mDataSize == 0)
@@ -382,9 +384,9 @@ merge_pass(unsigned lvl,
   // remove exhausted partitions that participated in this merge operation
   seastar::parallel_for_each(
     reader_shard_indices,
-    [&](unsigned i) {
+    [&](unsigned shard_idx) {
       return sharded_reader.invoke_on(
-        i, [](RunReaderService& r) { return r.remove_file(); });
+        shard_idx, [](RunReaderService& r) { return r.remove_file(); });
     })
     .get0();
 }
@@ -393,7 +395,8 @@ void
 merge_algorithm(unsigned initial_partition_count,
                 std::size_t input_file_size,
                 seastar::sharded<RunReaderService>& sharded_reader,
-                std::size_t per_cpu_memory)
+                std::size_t per_cpu_memory,
+                seastar::sstring const& output_filepath)
 {
   const unsigned K = seastar::smp::count - 1;
 
@@ -445,6 +448,12 @@ merge_algorithm(unsigned initial_partition_count,
     part_size = align_to_record_size(part_size);
     prev_lvl_partition_count = (input_file_size + part_size - 1) / part_size;
   }
+
+  // move last produced partition to `output_file` destination
+  seastar::rename_file("/opt/test_data/part-lvl" +
+                         seastar::to_sstring(lvl - 1) + "-0",
+                       output_filepath)
+    .get0();
 }
 
 int
@@ -477,18 +486,28 @@ main(int argc, char** argv)
                  per_cpu_memory / 1024 / 1024);
 
       auto& opts = app.configuration();
-      seastar::sstring const& input_filepath =
-        opts["input"].as<seastar::sstring>();
+      seastar::sstring const &input_filepath =
+                               opts["input"].as<seastar::sstring>(),
+                             ouptut_filepath =
+                               opts["output"].as<seastar::sstring>();
       auto input_fd =
         seastar::open_file_dma(input_filepath, seastar::open_flags::ro).get0();
       std::size_t const input_size = input_fd.size().get0();
 
-      partitioner.start(input_fd.dup(), input_size, per_cpu_memory).get0();
       seastar::engine().at_exit([&partitioner] { return partitioner.stop(); });
 
       // initial partitioning pass
-      partitioner.invoke_on_all([](auto& p) { return p.start(); }).get0();
-      input_fd.close().get0();
+      seastar::do_with(
+        std::move(input_fd),
+        [&, input_size, per_cpu_memory](seastar::file& input_fd) {
+          return partitioner.start(input_fd.dup(), input_size, per_cpu_memory)
+            .then([&partitioner] {
+              return partitioner.invoke_on_all(
+                [](auto& p) { return p.start(); });
+            })
+            .then([&input_fd] { return input_fd.close(); });
+        })
+        .get0();
 
       seastar::engine().at_exit(
         [&sharded_reader] { return sharded_reader.stop(); });
@@ -497,7 +516,8 @@ main(int argc, char** argv)
       merge_algorithm(partitioner.local().total_partitions_count(),
                       input_size,
                       sharded_reader,
-                      per_cpu_memory);
+                      per_cpu_memory,
+                      ouptut_filepath);
     });
   });
 }
