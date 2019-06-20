@@ -98,8 +98,8 @@ public:
                      size_t cpu_memory,
                      seastar::sstring temp_path)
     : mInputFile(fd.to_file())
-    // align to be a multiple of `record_size`
-    , mAlignedCpuMemSize(align_to_record_size(cpu_memory))
+    // aligned to be a multiple of `RECORD_SIZE`
+    , mAlignedCpuMemSize(cpu_memory)
     , mCurrentPartitionId(seastar::engine().cpu_id())
     , mPartitionsCount(round_up_int_div(input_fd_size, mAlignedCpuMemSize))
     , mTempBuf(OUT_BUF_SIZE)
@@ -229,8 +229,7 @@ class RunReaderService
 
 public:
   RunReaderService(std::size_t mem)
-    : mAlignedCpuMemSize(
-        align_to_record_size(mem)) // align to be a multiple of `record_size`
+    : mAlignedCpuMemSize(mem) // aligned to be a multiple of `RECORD_SIZE`
   {}
 
   seastar::future<> stop()
@@ -285,24 +284,6 @@ public:
   }
 };
 
-void
-write_to_file_from_buf(
-  seastar::file& output_file,
-  seastar::temporary_buffer<record_underlying_type> const& buf,
-  std::size_t buf_size,
-  uint64_t& outfile_write_pos,
-  uint64_t& buf_write_pos)
-{
-  task_logger.info("writing {} bytes from temporary buffer to the partition",
-                   buf_size);
-  output_file
-    .dma_write<record_underlying_type>(outfile_write_pos, buf.get(), buf_size)
-    .wait();
-  output_file.flush().wait();
-  outfile_write_pos += buf_size;
-  buf_write_pos = 0u;
-}
-
 class MergeAlgorithm
 {
   using priority_queue_type =
@@ -338,7 +319,8 @@ public:
   {
     const unsigned K = seastar::smp::count - 1;
 
-    std::size_t part_size = align_to_record_size(mPerCpuMemory);
+    std::size_t part_size =
+      mPerCpuMemory; // aligned to be a multiple of `RECORD_SIZE`
 
     uint32_t lvl = 1u;
     uint32_t prev_lvl_partition_count = mInitialPartCount;
@@ -465,20 +447,20 @@ private:
         mPq.pop();
         // flush full output buffer contents to the output file
         if (buf_write_pos == OUT_BUF_SIZE) {
-          write_to_file_from_buf(output_file,
-                                 out_buf,
-                                 OUT_BUF_SIZE,
-                                 outfile_write_pos,
-                                 buf_write_pos);
+          write_buf(output_file,
+                    out_buf,
+                    OUT_BUF_SIZE,
+                    outfile_write_pos,
+                    buf_write_pos);
         }
       }
       // flush remaining part of the output buffer to the file
       if (buf_write_pos != 0) {
-        write_to_file_from_buf(output_file,
-                               out_buf,
-                               buf_write_pos,
-                               outfile_write_pos,
-                               buf_write_pos);
+        write_buf(output_file,
+                  out_buf,
+                  buf_write_pos,
+                  outfile_write_pos,
+                  buf_write_pos);
       }
 
       // transfer control to reactor event loop to prevent reactor stalls
@@ -496,6 +478,22 @@ private:
           shard_idx, [](RunReaderService& r) { return r.remove_file(); });
       })
       .wait();
+  }
+
+  void write_buf(seastar::file& output_file,
+                 seastar::temporary_buffer<record_underlying_type> const& buf,
+                 std::size_t buf_size,
+                 uint64_t& outfile_write_pos,
+                 uint64_t& buf_write_pos)
+  {
+    task_logger.info("writing {} bytes from temporary buffer to the partition",
+                     buf_size);
+    output_file
+      .dma_write<record_underlying_type>(outfile_write_pos, buf.get(), buf_size)
+      .wait();
+    output_file.flush().wait();
+    outfile_write_pos += buf_size;
+    buf_write_pos = 0u;
   }
 };
 
@@ -520,17 +518,20 @@ main(int argc, char** argv)
       seastar::engine().at_exit(
         [&sharded_reader] { return sharded_reader.stop(); });
 
-      std::size_t const available_memory =
-                          seastar::memory::stats().free_memory() / 2,
-                        per_cpu_memory = available_memory / seastar::smp::count;
+      std::size_t const per_cpu_memory = seastar::memory::stats().free_memory();
       fmt::print("Number of cores: {}\n"
-                 "Total available memory: {} bytes ({} MB)\n"
-                 "Memory available to each core: {} bytes ({} MB)\n",
+                 "Raw memory available to each core: {} bytes ({} MB)\n",
                  seastar::smp::count,
-                 available_memory,
-                 available_memory / 1024 / 1024,
                  per_cpu_memory,
-                 per_cpu_memory / 1024 / 1024);
+                 per_cpu_memory / seastar::MB);
+
+      // TODO: reason this constant value (at least empirically)
+      float const cpu_mem_threshold = 0.8f;
+      std::size_t const aligned_cpu_mem = align_to_record_size(
+        static_cast<std::size_t>(cpu_mem_threshold * per_cpu_memory));
+      fmt::print("Reserved per-cpu memory size: {} bytes ({} MB)\n",
+                 aligned_cpu_mem,
+                 aligned_cpu_mem / seastar::MB);
 
       auto& opts = app.configuration();
       seastar::sstring const &input_filepath =
@@ -555,29 +556,30 @@ main(int argc, char** argv)
             return seastar::engine().remove_file(output_filepath);
           return seastar::make_ready_future<>();
         })
-        .then([&partitioner, &input_fd, input_size, per_cpu_memory, temp_path] {
-          // initial partitioning pass
-          return seastar::do_with(
-            std::move(input_fd),
-            [&partitioner,
-             input_size,
-             per_cpu_memory,
-             temp_path = std::move(temp_path)](seastar::file& input_fd) {
-              return partitioner
-                .start(input_fd.dup(), input_size, per_cpu_memory, temp_path)
-                .then([&partitioner] {
-                  return partitioner.invoke_on_all(
-                    [](auto& p) { return p.start(); });
-                })
-                .then([&input_fd] { return input_fd.close(); });
-            });
-        })
+        .then(
+          [&partitioner, &input_fd, input_size, aligned_cpu_mem, temp_path] {
+            // initial partitioning pass
+            return seastar::do_with(
+              std::move(input_fd),
+              [&partitioner,
+               input_size,
+               aligned_cpu_mem,
+               temp_path = std::move(temp_path)](seastar::file& input_fd) {
+                return partitioner
+                  .start(input_fd.dup(), input_size, aligned_cpu_mem, temp_path)
+                  .then([&partitioner] {
+                    return partitioner.invoke_on_all(
+                      [](auto& p) { return p.start(); });
+                  })
+                  .then([&input_fd] { return input_fd.close(); });
+              });
+          })
         .then([&, temp_path] {
           return seastar::async([&, temp_path = std::move(temp_path)] {
             // invoke K-way merge sorting algorithm
             MergeAlgorithm malgo(partitioner.local().total_partitions_count(),
                                  input_size,
-                                 per_cpu_memory,
+                                 aligned_cpu_mem,
                                  output_filepath,
                                  temp_path,
                                  sharded_reader);
