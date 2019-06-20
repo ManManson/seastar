@@ -115,7 +115,8 @@ public:
       [this] { return mCurrentRunId >= mRunCount; },
       [this] {
         mWritePos = 0;
-        task_logger.info("run {}. reading {} bytes from input file. Offset {}",
+        task_logger.info("Initializing run {}. Reading {} bytes at the offset "
+                         "{} from the input file.",
                          mCurrentRunId,
                          mAlignedCpuMemSize,
                          mCurrentRunId * mAlignedCpuMemSize);
@@ -147,24 +148,23 @@ private:
                  .then([this, &rptr_vec](seastar::file output_run_fd) {
                    return seastar::do_with(
                      std::move(output_run_fd), [&](auto& output_run_fd) {
-                       task_logger.info("writing to partition {}",
-                                        mCurrentRunId);
+                       auto old_run_id = mCurrentRunId;
                        mCurrentRunId += seastar::smp::count;
                        return seastar::do_until(
                                 [this, &rptr_vec] {
                                   return mInBufferSliceIt == rptr_vec.cend();
                                 },
-                                [this, &rptr_vec, &output_run_fd] {
+                                [this, &rptr_vec, &output_run_fd, old_run_id] {
                                   auto actual_size =
                                     fill_output_buffer(rptr_vec);
                                   return output_run_fd
                                     .dma_write(
                                       mWritePos, mTempBuf.get(), actual_size)
-                                    .then([&](size_t s) {
-                                      task_logger.info(
-                                        "successfully written {} "
-                                        "bytes to partition",
-                                        s);
+                                    .then([&, old_run_id](size_t s) {
+                                      task_logger.info("Written {} "
+                                                       "bytes to the run {}",
+                                                       s,
+                                                       old_run_id);
                                       mWritePos += s;
                                     });
                                 })
@@ -235,7 +235,7 @@ public:
     return seastar::make_ready_future<>();
   }
 
-  seastar::future<> set_file(seastar::sstring filepath, seastar::file fd)
+  seastar::future<> set_run_fd(seastar::sstring filepath, seastar::file fd)
   {
     mFd = std::move(fd);
     mFilePath = std::move(filepath);
@@ -243,19 +243,19 @@ public:
     return seastar::make_ready_future<>();
   }
 
-  seastar::future<> open_file(seastar::sstring path)
+  seastar::future<> open_run_file(seastar::sstring path)
   {
     return seastar::do_with(std::move(path), [&](auto& path) {
       return seastar::open_file_dma(path, seastar::open_flags::ro)
         .then([this, &path](seastar::file fd) {
-          return set_file(path, std::move(fd));
+          return set_run_fd(path, std::move(fd));
         });
     });
   }
 
-  seastar::future<> remove_file()
+  seastar::future<> remove_run_file()
   {
-    task_logger.info("removing file {}", mFilePath);
+    task_logger.info("removing file \"{}\"", mFilePath);
     return mFd.close()
       .then([this] { return seastar::remove_file(mFilePath); })
       .then([this] { mFd = seastar::file(); });
@@ -324,7 +324,7 @@ public:
     mRunReader.start(mPerCpuMemory).wait();
 
     while (prev_lvl_run_count > 1) {
-      task_logger.info("invoking merge pass (level {})", lvl);
+      task_logger.info("Start merge pass (level {})", lvl);
 
       // assign unprocessed initial run ids
       std::queue<uint32_t> unprocessed_ids;
@@ -358,7 +358,15 @@ public:
     }
 
     // move last produced run to `output_file` destination
-    seastar::rename_file(run_filename(mTempPath, lvl - 1, 0), mOutputFilepath)
+    auto last_run_path = run_filename(mTempPath, lvl - 1, 0);
+    task_logger.info(
+      "Moving the last run file \"{}\" to the final destination \"{}\"",
+      last_run_path,
+      mOutputFilepath);
+    seastar::rename_file(last_run_path, mOutputFilepath)
+      .then([] {
+        task_logger.info("Successfully moved file to the final destination");
+      })
       .wait();
   }
 
@@ -389,15 +397,13 @@ private:
       reader_shard_indices,
       [this, &assigned_ids, lvl](unsigned shard_idx) {
         return mRunReader.invoke_on(shard_idx, [&](RunReaderService& r) {
-          task_logger.info("opening run on shard {}",
-                           seastar::engine().cpu_id());
-          return r.open_file(run_filename(
-            mTempPath, lvl - 1, assigned_ids[seastar::engine().cpu_id() - 1]));
+          unsigned run_lvl = lvl - 1,
+                   run_id = assigned_ids[seastar::engine().cpu_id() - 1];
+          task_logger.info("opening file for the run {}/{}", run_lvl, run_id);
+          return r.open_run_file(run_filename(mTempPath, run_lvl, run_id));
         });
       })
       .wait();
-
-    task_logger.info("successfully opened reading streams on reader shards");
 
     // while there is something to process in at least one reader
     while (outfile_write_pos <
@@ -446,7 +452,9 @@ private:
                     out_buf,
                     OUT_BUF_SIZE,
                     outfile_write_pos,
-                    buf_write_pos);
+                    buf_write_pos,
+                    lvl,
+                    current_run_id);
         }
       }
       // flush remaining part of the output buffer to the file
@@ -455,7 +463,9 @@ private:
                   out_buf,
                   buf_write_pos,
                   outfile_write_pos,
-                  buf_write_pos);
+                  buf_write_pos,
+                  lvl,
+                  current_run_id);
       }
 
       // transfer control to reactor event loop to prevent reactor stalls
@@ -470,7 +480,7 @@ private:
       reader_shard_indices,
       [this](unsigned shard_idx) {
         return mRunReader.invoke_on(
-          shard_idx, [](RunReaderService& r) { return r.remove_file(); });
+          shard_idx, [](RunReaderService& r) { return r.remove_run_file(); });
       })
       .wait();
   }
@@ -479,10 +489,12 @@ private:
                  seastar::temporary_buffer<record_underlying_type> const& buf,
                  std::size_t buf_size,
                  uint64_t& outfile_write_pos,
-                 uint64_t& buf_write_pos)
+                 uint64_t& buf_write_pos,
+                 unsigned run_lvl,
+                 unsigned run_id)
   {
-    task_logger.info("writing {} bytes from temporary buffer to the partition",
-                     buf_size);
+    task_logger.info(
+      "writing {} bytes to the run {}/{}", buf_size, run_lvl, run_id);
     output_file
       .dma_write<record_underlying_type>(outfile_write_pos, buf.get(), buf_size)
       .wait();
@@ -515,7 +527,8 @@ main(int argc, char** argv)
         [&sharded_reader_srv] { return sharded_reader_srv.stop(); });
 
       std::size_t const per_cpu_memory = seastar::memory::stats().free_memory();
-      fmt::print("Number of cores: {}\n"
+      fmt::print("------\n"
+                 "Number of cores: {}\n"
                  "Raw memory available to each core: {} bytes ({} MB)\n",
                  seastar::smp::count,
                  per_cpu_memory,
@@ -523,11 +536,13 @@ main(int argc, char** argv)
 
       // On my machine Seastar reports that each core has 1GB free memory.
       // leave 64MB for temporary buffers and also reserve a little bit more
-      // for the regular operation of merging algorithm.
+      // to be sure that we don't hit the limit while allocating supplementary
+      // structures during regular operation of merging algorithm.
       float const cpu_mem_threshold = 0.8f;
       std::size_t const aligned_cpu_mem = align_to_record_size(
         static_cast<std::size_t>(cpu_mem_threshold * per_cpu_memory));
-      fmt::print("Reserved per-cpu memory size: {} bytes ({} MB)\n",
+      fmt::print("Reserved per-cpu memory size: {} bytes ({} MB)\n"
+                 "------\n",
                  aligned_cpu_mem,
                  aligned_cpu_mem / seastar::MB);
 
@@ -537,6 +552,9 @@ main(int argc, char** argv)
                              output_filepath =
                                opts["output"].as<seastar::sstring>(),
                              temp_path = opts["tmp"].as<seastar::sstring>();
+
+      task_logger.info("Opening input file at \"{}\"", input_filepath);
+
       auto input_fd =
         seastar::open_file_dma(input_filepath, seastar::open_flags::ro).get0();
       std::size_t const input_size = input_fd.size().get0();
@@ -546,12 +564,18 @@ main(int argc, char** argv)
           "Input file size should be a multiple of RECORD_SIZE (4096 bytes)");
       }
 
+      task_logger.info("Successfully opened input file. File size: {} bytes",
+                       input_size);
+
       seastar::engine()
         .file_exists(output_filepath)
         .then([output_filepath](bool exists) {
           // remove output file if it already exists
-          if (exists)
+          if (exists) {
+            task_logger.info("Output file \"{}\" already exists. Removing.",
+                             output_filepath);
             return seastar::engine().remove_file(output_filepath);
+          }
           return seastar::make_ready_future<>();
         })
         .then(
