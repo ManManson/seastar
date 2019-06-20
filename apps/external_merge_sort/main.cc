@@ -481,13 +481,13 @@ main(int argc, char** argv)
 {
   seastar::app_template app;
   auto opts_adder = app.add_options();
-  opts_adder(
-    "input",
-    bpo::value<seastar::sstring>()->default_value("/opt/test_data/tf1"),
-    "path to the large file to be sorted")(
-    "output",
-    bpo::value<seastar::sstring>()->default_value("/opt/test_data/output_tf"),
-    "path to the sorted output file");
+  opts_adder("input",
+             bpo::value<seastar::sstring>(),
+             "path to the large file to be sorted")(
+    "output", bpo::value<seastar::sstring>(), "path to the sorted output file")(
+    "tmp",
+    bpo::value<seastar::sstring>()->default_value("/tmp"),
+    "path to temp directory where intermediate partitions are stored");
 
   seastar::sharded<PartitionerService> partitioner;
   seastar::sharded<RunReaderService> sharded_reader;
@@ -513,7 +513,8 @@ main(int argc, char** argv)
       seastar::sstring const &input_filepath =
                                opts["input"].as<seastar::sstring>(),
                              output_filepath =
-                               opts["output"].as<seastar::sstring>();
+                               opts["output"].as<seastar::sstring>(),
+                             temp_path = opts["tmp"].as<seastar::sstring>();
       auto input_fd =
         seastar::open_file_dma(input_filepath, seastar::open_flags::ro).get0();
       std::size_t const input_size = input_fd.size().get0();
