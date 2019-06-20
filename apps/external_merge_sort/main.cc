@@ -506,21 +506,21 @@ private:
                    return seastar::do_for_each(
                             reader_shard_indices,
                             [&](unsigned shard_idx) {
-                              return seastar::async([&] {
-                                // fetch data and retrieve corresponding data
-                                // fragment pointing to the available data on
-                                // the shard
-                                DataFragment frag =
-                                  fetch_and_get_data(shard_idx).get0();
+                              // fetch data and retrieve corresponding data
+                              // fragment pointing to the available data on
+                              // the shard
+                              return fetch_and_get_data(shard_idx).then(
+                                [this](DataFragment const& frag) {
+                                  // skip the reader if there is no data, it has
+                                  // definitely reached EOF
+                                  if (frag.mDataSize == 0)
+                                    return seastar::make_ready_future<>();
 
-                                // skip the reader if there is no data, it has
-                                // definitely reached EOF
-                                if (frag.mDataSize == 0)
-                                  return;
+                                  // sort data locally on zero-th core
+                                  pq_consume_fragment(frag);
 
-                                // sort data locally on zero-th core
-                                pq_consume_fragment(frag);
-                              });
+                                  return seastar::make_ready_future<>();
+                                });
                             })
                      .then([&] {
                        if (mPq.empty()) {
