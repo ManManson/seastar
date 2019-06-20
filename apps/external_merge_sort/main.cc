@@ -43,12 +43,14 @@ struct inverse_record_compare
   }
 };
 
+// Align `s` to be a multiple of `RECORD_SIZE`
 constexpr std::size_t
 align_to_record_size(std::size_t s)
 {
   return s / RECORD_SIZE * RECORD_SIZE;
 }
 
+// Integer division with rounding policy that rounds up
 constexpr std::size_t
 round_up_int_div(std::size_t num, std::size_t denom)
 {
@@ -77,6 +79,11 @@ run_filename(seastar::sstring const& dst, unsigned level, unsigned id)
   return result;
 }
 
+///
+/// \brief The InitialRunService class
+/// sharded service that walks through the input and generates a series of
+/// initial runs to be consumed in a later merge procedure.
+///
 class InitialRunService
 {
   seastar::file mInputFile;
@@ -150,6 +157,8 @@ private:
                      std::move(output_run_fd), [&](auto& output_run_fd) {
                        auto old_run_id = mCurrentRunId;
                        mCurrentRunId += seastar::smp::count;
+                       // write sorted data to the
+                       // output in a series of chunks
                        return seastar::do_until(
                                 [this, &rptr_vec] {
                                   return mInBufferSliceIt == rptr_vec.cend();
@@ -214,6 +223,10 @@ struct DataFragment
   std::size_t mDataSize;                   // array size in bytes
 };
 
+///
+/// \brief The RunReaderService class
+/// Manages opening, disposing, reading and fetching portions of data from a run
+///
 class RunReaderService
 {
   seastar::file mFd;
@@ -375,6 +388,46 @@ public:
   }
 
 private:
+  ///
+  /// \brief The TempBufferWriter class
+  /// Simple wrapper around output file and buffer to aid in writing output
+  /// buffer to the new run
+  ///
+  class TempBufferWriter
+  {
+    seastar::file& mOutputFile;
+    seastar::temporary_buffer<record_underlying_type> const& mBuf;
+    unsigned mLvl;
+    unsigned mRunId;
+
+  public:
+    TempBufferWriter(
+      seastar::file& out,
+      seastar::temporary_buffer<record_underlying_type> const& buf,
+      unsigned lvl,
+      unsigned run_id)
+      : mOutputFile(out)
+      , mBuf(buf)
+      , mLvl(lvl)
+      , mRunId(run_id)
+    {}
+
+    void write(std::size_t buf_size,
+               uint64_t& outfile_write_pos,
+               uint64_t& buf_write_pos)
+    {
+      task_logger.info(
+        "writing {} bytes to the run {}/{}", buf_size, mLvl, mRunId);
+      mOutputFile
+        .dma_write<record_underlying_type>(
+          outfile_write_pos, mBuf.get(), buf_size)
+        .wait();
+      mOutputFile.flush().wait();
+      outfile_write_pos += buf_size;
+      buf_write_pos = 0u;
+    }
+  };
+
   void merge_pass(unsigned lvl,
                   unsigned current_run_id,
                   std::vector<unsigned> const& assigned_ids,
@@ -382,8 +435,12 @@ private:
   {
     static constexpr size_t OUT_BUF_SIZE =
       align_to_record_size(32u * seastar::MB);
+
+    std::size_t const readers_count = assigned_ids.size();
+
+    // shift indices by 1 since we want to skip zero-th shard from reading
     auto const reader_shard_indices =
-      boost::irange(static_cast<size_t>(1u), assigned_ids.size() + 1);
+      boost::irange(static_cast<size_t>(1u), readers_count + 1);
 
     seastar::temporary_buffer<record_underlying_type> out_buf(OUT_BUF_SIZE);
     uint64_t buf_write_pos = 0u;
@@ -409,10 +466,13 @@ private:
       })
       .wait();
 
+    TempBufferWriter buf_writer(output_file, out_buf, lvl, current_run_id);
+
     // while there is something to process in at least one reader
-    while (outfile_write_pos <
-           run_size * assigned_ids.size()) { // run_size * <readers_count>
+    while (outfile_write_pos < run_size * readers_count) {
       for (auto shard_idx : reader_shard_indices) {
+        // fetch data and retrieve corresponding data fragment pointing to the
+        // available data on the shard
         DataFragment fragment =
           mRunReader
             .invoke_on(shard_idx,
@@ -428,6 +488,7 @@ private:
             })
             .get0();
 
+        // skip the reader if there is no data, it has definitely reached EOF
         if (fragment.mDataSize == 0)
           continue;
 
@@ -452,24 +513,12 @@ private:
         mPq.pop();
         // flush full output buffer contents to the output file
         if (buf_write_pos == OUT_BUF_SIZE) {
-          write_buf(output_file,
-                    out_buf,
-                    OUT_BUF_SIZE,
-                    outfile_write_pos,
-                    buf_write_pos,
-                    lvl,
-                    current_run_id);
+          buf_writer.write(OUT_BUF_SIZE, outfile_write_pos, buf_write_pos);
         }
       }
       // flush remaining part of the output buffer to the file
       if (buf_write_pos != 0) {
-        write_buf(output_file,
-                  out_buf,
-                  buf_write_pos,
-                  outfile_write_pos,
-                  buf_write_pos,
-                  lvl,
-                  current_run_id);
+        buf_writer.write(buf_write_pos, outfile_write_pos, buf_write_pos);
       }
 
       // transfer control to reactor event loop to prevent reactor stalls
@@ -487,24 +536,6 @@ private:
           shard_idx, [](RunReaderService& r) { return r.remove_run_file(); });
       })
       .wait();
-  }
-
-  void write_buf(seastar::file& output_file,
-                 seastar::temporary_buffer<record_underlying_type> const& buf,
-                 std::size_t buf_size,
-                 uint64_t& outfile_write_pos,
-                 uint64_t& buf_write_pos,
-                 unsigned run_lvl,
-                 unsigned run_id)
-  {
-    task_logger.info(
-      "writing {} bytes to the run {}/{}", buf_size, run_lvl, run_id);
-    output_file
-      .dma_write<record_underlying_type>(outfile_write_pos, buf.get(), buf_size)
-      .wait();
-    output_file.flush().wait();
-    outfile_write_pos += buf_size;
-    buf_write_pos = 0u;
   }
 };
 
