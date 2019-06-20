@@ -134,13 +134,13 @@ private:
     return seastar::do_with(
              std::move(buf),
              std::move(rptr_vec),
-             [&](auto& buf, auto& rptr_vec) {
+             [this, &rptr_vec](auto& buf, auto& rptr_vec) {
                return seastar::open_file_dma(
                         partition_filename(0u, mCurrentPartitionId),
                         seastar::open_flags::create |
                           seastar::open_flags::truncate |
                           seastar::open_flags::wo)
-                 .then([&](seastar::file output_partition_fd) {
+                 .then([this, &rptr_vec](seastar::file output_partition_fd) {
                    return seastar::do_with(
                      std::move(output_partition_fd),
                      [&](auto& output_partition_fd) {
@@ -148,10 +148,10 @@ private:
                                         mCurrentPartitionId);
                        mCurrentPartitionId += seastar::smp::count;
                        return seastar::do_until(
-                                [&] {
+                                [this, &rptr_vec] {
                                   return mInBufferSliceIt == rptr_vec.cend();
                                 },
-                                [&] {
+                                [this, &rptr_vec, &output_partition_fd] {
                                   auto actual_size =
                                     fill_output_buffer(rptr_vec);
                                   return output_partition_fd
@@ -247,7 +247,9 @@ public:
   {
     return seastar::do_with(std::move(path), [&](auto& path) {
       return seastar::open_file_dma(path, seastar::open_flags::ro)
-        .then([&](seastar::file fd) { return set_file(path, std::move(fd)); });
+        .then([this, &path](seastar::file fd) {
+          return set_file(path, std::move(fd));
+        });
     });
   }
 
@@ -255,13 +257,13 @@ public:
   {
     task_logger.info("removing file {}", mFilePath);
     return mFd.close()
-      .then([&] { return seastar::remove_file(mFilePath); })
-      .then([&] { mFd = seastar::file(); });
+      .then([this] { return seastar::remove_file(mFilePath); })
+      .then([this] { mFd = seastar::file(); });
   }
 
   seastar::future<std::size_t> fetch_data()
   {
-    return seastar::async([&]() -> std::size_t {
+    return seastar::async([this]() -> std::size_t {
       mBuf =
         mFd
           .dma_read<record_underlying_type>(mCurrentReadPos, mAlignedCpuMemSize)
@@ -328,7 +330,7 @@ merge_pass(unsigned lvl,
   // open assigned file ids
   seastar::parallel_for_each(
     reader_shard_indices,
-    [&](unsigned shard_idx) {
+    [&sharded_reader, &assigned_ids, lvl](unsigned shard_idx) {
       return sharded_reader.invoke_on(shard_idx, [&](RunReaderService& r) {
         task_logger.info("opening partition on shard {}",
                          seastar::engine().cpu_id());
@@ -347,7 +349,7 @@ merge_pass(unsigned lvl,
       DataFragment fragment =
         sharded_reader
           .invoke_on(shard_idx,
-                     [&](RunReaderService& r) {
+                     [](RunReaderService& r) {
                        return r.fetch_data().then([](std::size_t) {
                          return seastar::make_ready_future<>();
                        });
@@ -402,7 +404,7 @@ merge_pass(unsigned lvl,
   // remove exhausted partitions that participated in this merge operation
   seastar::parallel_for_each(
     reader_shard_indices,
-    [&](unsigned shard_idx) {
+    [&sharded_reader](unsigned shard_idx) {
       return sharded_reader.invoke_on(
         shard_idx, [](RunReaderService& r) { return r.remove_file(); });
     })
@@ -529,11 +531,12 @@ main(int argc, char** argv)
             return seastar::engine().remove_file(output_filepath);
           return seastar::make_ready_future<>();
         })
-        .then([&] {
+        .then([&partitioner, &input_fd, input_size, per_cpu_memory] {
           // initial partitioning pass
           return seastar::do_with(
             std::move(input_fd),
-            [&, input_size, per_cpu_memory](seastar::file& input_fd) {
+            [&partitioner, input_size, per_cpu_memory](
+              seastar::file& input_fd) {
               return partitioner
                 .start(input_fd.dup(), input_size, per_cpu_memory)
                 .then([&partitioner] {
