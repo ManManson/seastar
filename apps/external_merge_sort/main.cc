@@ -290,8 +290,8 @@ write_to_file_from_buf(
                    buf_size);
   output_file
     .dma_write<record_underlying_type>(outfile_write_pos, buf.get(), buf_size)
-    .get0();
-  output_file.flush().get0();
+    .wait();
+  output_file.flush().wait();
   outfile_write_pos += buf_size;
   buf_write_pos = 0u;
 }
@@ -336,7 +336,7 @@ merge_pass(unsigned lvl,
           lvl - 1, assigned_ids[seastar::engine().cpu_id() - 1]));
       });
     })
-    .get0();
+    .wait();
 
   task_logger.info("successfully opened reading streams on reader shards");
 
@@ -397,7 +397,7 @@ merge_pass(unsigned lvl,
       seastar::thread::yield();
   }
 
-  output_file.close().get0();
+  output_file.close().wait();
 
   // remove exhausted partitions that participated in this merge operation
   seastar::parallel_for_each(
@@ -406,7 +406,7 @@ merge_pass(unsigned lvl,
       return sharded_reader.invoke_on(
         shard_idx, [](RunReaderService& r) { return r.remove_file(); });
     })
-    .get0();
+    .wait();
 }
 
 void
@@ -423,7 +423,7 @@ merge_algorithm(unsigned initial_partition_count,
   uint32_t lvl = 1u;
   uint32_t prev_lvl_partition_count = initial_partition_count;
 
-  sharded_reader.start(per_cpu_memory).get0();
+  sharded_reader.start(per_cpu_memory).wait();
 
   priority_queue_type priorq;
 
@@ -471,7 +471,7 @@ merge_algorithm(unsigned initial_partition_count,
   seastar::rename_file("/opt/test_data/part-lvl" +
                          seastar::to_sstring(lvl - 1) + "-0",
                        output_filepath)
-    .get0();
+    .wait();
 }
 
 int
@@ -521,35 +521,39 @@ main(int argc, char** argv)
           "Input file size should be a multiple of RECORD_SIZE (4096 bytes)");
       }
 
-      // remove output file in case it already exists
       seastar::engine()
         .file_exists(output_filepath)
         .then([output_filepath](bool exists) {
+          // remove output file if it already exists
           if (exists)
             return seastar::engine().remove_file(output_filepath);
           return seastar::make_ready_future<>();
         })
-        .get0();
-
-      // initial partitioning pass
-      seastar::do_with(
-        std::move(input_fd),
-        [&, input_size, per_cpu_memory](seastar::file& input_fd) {
-          return partitioner.start(input_fd.dup(), input_size, per_cpu_memory)
-            .then([&partitioner] {
-              return partitioner.invoke_on_all(
-                [](auto& p) { return p.start(); });
-            })
-            .then([&input_fd] { return input_fd.close(); });
+        .then([&] {
+          // initial partitioning pass
+          return seastar::do_with(
+            std::move(input_fd),
+            [&, input_size, per_cpu_memory](seastar::file& input_fd) {
+              return partitioner
+                .start(input_fd.dup(), input_size, per_cpu_memory)
+                .then([&partitioner] {
+                  return partitioner.invoke_on_all(
+                    [](auto& p) { return p.start(); });
+                })
+                .then([&input_fd] { return input_fd.close(); });
+            });
         })
-        .get0();
-
-      // invoke K-way merge sorting algorithm
-      merge_algorithm(partitioner.local().total_partitions_count(),
-                      input_size,
-                      sharded_reader,
-                      per_cpu_memory,
-                      output_filepath);
+        .then([&] {
+          return seastar::async([&] {
+            // invoke K-way merge sorting algorithm
+            merge_algorithm(partitioner.local().total_partitions_count(),
+                            input_size,
+                            sharded_reader,
+                            per_cpu_memory,
+                            output_filepath);
+          });
+        })
+        .wait();
     });
   });
 }
