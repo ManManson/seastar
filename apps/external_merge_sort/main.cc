@@ -274,7 +274,7 @@ public:
       .then([this] { mFd = seastar::file(); });
   }
 
-  seastar::future<std::size_t> fetch_data()
+  seastar::future<> fetch_data()
   {
     return mFd
       .dma_read<record_underlying_type>(mCurrentReadPos, mAlignedCpuMemSize)
@@ -282,7 +282,6 @@ public:
         mBuf = std::move(buf);
         mActualBufSize = mBuf.size();
         mCurrentReadPos += mActualBufSize;
-        return mActualBufSize;
       });
   }
 
@@ -325,8 +324,10 @@ public:
 
   void merge()
   {
+    // K-way merge sort constant
     const unsigned K = seastar::smp::count - 1;
 
+    // Maximum size of each individual run on the previous level
     std::size_t run_size =
       mPerCpuMemory; // aligned to be a multiple of `RECORD_SIZE`
 
@@ -394,11 +395,17 @@ private:
   ///
   class TempBufferWriter
   {
+    // output file handle to be populated from the internal buffer
     seastar::file& mOutputFile;
+    // temporary buffer to support chunked output to the file
+    // gets filled in `pq_consume_fragment` calls
     seastar::temporary_buffer<record_underlying_type> const& mBuf;
+    // current merging pass level and run id for logging
     unsigned mLvl;
     unsigned mRunId;
+    // output file write offset and buffer write
     uint64_t& mOutFileWritePos;
+    // current buffer end position, gets zero'ed after successful flush to file
     uint64_t& mBufWritePos;
 
   public:
@@ -437,12 +444,7 @@ private:
   seastar::future<DataFragment> fetch_and_get_data(unsigned shard_idx)
   {
     return mRunReader
-      .invoke_on(shard_idx,
-                 [](RunReaderService& r) {
-                   return r.fetch_data().then([](std::size_t) {
-                     return seastar::make_ready_future<>();
-                   });
-                 })
+      .invoke_on(shard_idx, [](RunReaderService& r) { return r.fetch_data(); })
       .then([this, shard_idx] {
         return mRunReader.invoke_on(
           shard_idx, [](RunReaderService& r) { return r.data_fragment(); });
@@ -539,6 +541,8 @@ private:
                          return seastar::make_ready_future<>();
                        }
 
+                       // flush priority queue to the output buffer and then
+                       // to the file (in chunks)
                        return seastar::do_until(
                                 [this] { return mPq.empty(); },
                                 [&] {
