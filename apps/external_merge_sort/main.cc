@@ -276,15 +276,14 @@ public:
 
   seastar::future<std::size_t> fetch_data()
   {
-    return seastar::async([this]() -> std::size_t {
-      mBuf =
-        mFd
-          .dma_read<record_underlying_type>(mCurrentReadPos, mAlignedCpuMemSize)
-          .get0();
-      mActualBufSize = mBuf.size();
-      mCurrentReadPos += mActualBufSize;
-      return mActualBufSize;
-    });
+    return mFd
+      .dma_read<record_underlying_type>(mCurrentReadPos, mAlignedCpuMemSize)
+      .then([this](seastar::temporary_buffer<record_underlying_type> buf) {
+        mBuf = std::move(buf);
+        mActualBufSize = mBuf.size();
+        mCurrentReadPos += mActualBufSize;
+        return mActualBufSize;
+      });
   }
 
   DataFragment data_fragment()
