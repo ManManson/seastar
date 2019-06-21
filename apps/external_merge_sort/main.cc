@@ -399,32 +399,39 @@ private:
     seastar::temporary_buffer<record_underlying_type> const& mBuf;
     unsigned mLvl;
     unsigned mRunId;
+    uint64_t& mOutFileWritePos;
+    uint64_t& mBufWritePos;
 
   public:
     TempBufferWriter(
       seastar::file& out,
       seastar::temporary_buffer<record_underlying_type> const& buf,
       unsigned lvl,
-      unsigned run_id)
+      unsigned run_id,
+      uint64_t& outfile_write_pos,
+      uint64_t& buf_write_pos)
       : mOutputFile(out)
       , mBuf(buf)
       , mLvl(lvl)
       , mRunId(run_id)
+      , mOutFileWritePos(outfile_write_pos)
+      , mBufWritePos(buf_write_pos)
     {}
 
-    void write(std::size_t buf_size,
-               uint64_t& outfile_write_pos,
-               uint64_t& buf_write_pos)
+    seastar::future<> write(std::size_t buf_size)
     {
-      task_logger.info(
-        "writing {} bytes to the run {}/{}", buf_size, mLvl, mRunId);
-      mOutputFile
+      return mOutputFile
         .dma_write<record_underlying_type>(
-          outfile_write_pos, mBuf.get(), buf_size)
-        .wait();
-      mOutputFile.flush().wait();
-      outfile_write_pos += buf_size;
-      buf_write_pos = 0u;
+          mOutFileWritePos, mBuf.get(), buf_size)
+        .then([this](std::size_t written) {
+          mOutFileWritePos += written;
+          mBufWritePos = 0u;
+        })
+        .then([this] { return mOutputFile.flush(); })
+        .then([this, buf_size] {
+          task_logger.info(
+            "writing {} bytes to the run {}/{}", buf_size, mLvl, mRunId);
+        });
     }
   };
 
@@ -476,7 +483,12 @@ private:
         .get0();
     uint64_t outfile_write_pos = 0u;
 
-    TempBufferWriter buf_writer(output_file, out_buf, lvl, current_run_id);
+    TempBufferWriter buf_writer(output_file,
+                                out_buf,
+                                lvl,
+                                current_run_id,
+                                outfile_write_pos,
+                                buf_write_pos);
 
     bool nothing_to_fetch = false;
 
@@ -528,28 +540,32 @@ private:
                          return seastar::make_ready_future<>();
                        }
 
-                       return seastar::async([&] {
-                         while (!mPq.empty()) {
-                           record_underlying_type const* rec_ptr = mPq.top();
-                           std::copy(rec_ptr,
-                                     rec_ptr + RECORD_SIZE,
-                                     out_buf.get_write() + buf_write_pos);
-                           buf_write_pos += RECORD_SIZE;
-                           mPq.pop();
-                           // flush full output buffer contents to the output
-                           // file
-                           if (buf_write_pos == OUT_BUF_SIZE) {
-                             buf_writer.write(
-                               OUT_BUF_SIZE, outfile_write_pos, buf_write_pos);
+                       return seastar::do_until(
+                                [this] { return mPq.empty(); },
+                                [&] {
+                                  record_underlying_type const* rec_ptr =
+                                    mPq.top();
+                                  std::copy(rec_ptr,
+                                            rec_ptr + RECORD_SIZE,
+                                            out_buf.get_write() +
+                                              buf_write_pos);
+                                  buf_write_pos += RECORD_SIZE;
+                                  mPq.pop();
+                                  // flush full output buffer contents to the
+                                  // output file
+                                  if (buf_write_pos == OUT_BUF_SIZE) {
+                                    return buf_writer.write(OUT_BUF_SIZE);
+                                  }
+                                  return seastar::make_ready_future<>();
+                                })
+                         .then([&] {
+                           // flush remaining part of the output buffer
+                           // to the file
+                           if (buf_write_pos != 0) {
+                             return buf_writer.write(buf_write_pos);
                            }
-                         }
-                         // flush remaining part of the output buffer to the
-                         // file
-                         if (buf_write_pos != 0) {
-                           buf_writer.write(
-                             buf_write_pos, outfile_write_pos, buf_write_pos);
-                         }
-                       });
+                           return seastar::make_ready_future<>();
+                         });
                      });
                  })
           .then([&output_file] { return output_file.close(); })
