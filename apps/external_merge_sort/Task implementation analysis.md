@@ -88,3 +88,5 @@ We could avoid creating temporary files and use rewriting output file `in-place`
 Exception handling is poor, at least it should be checked that all reads and writes are secured in terms of error reporting.
 
 The code uses `seastar::async` paired with a series of `.wait()` at some places. It potentially limits the code parallelization degree. Also, it forces to manually invoke `seastar::thread::yield` to yield to reactor event loop for a while. So, all `while` and `for` (plus `seastar::async`) uses should be replaced with Seastar primitives like `seastar::do_until/seastar::do_for_each`. Explicit `wait()`s should be replaced with continuation chains.
+
+It would be nice to have CMake unit tests to be set up.
