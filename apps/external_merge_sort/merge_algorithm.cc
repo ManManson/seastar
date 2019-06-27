@@ -115,7 +115,7 @@ MergeAlgorithm::TempBufferWriter::write(std::size_t buf_size)
     .then([this] { return mOutputFile.flush(); })
     .then([this, buf_size] {
       task_logger.info(
-        "writing {} bytes to the run {}/{}", buf_size, mLvl, mRunId);
+        "writing {} bytes to the run <id {}, level {}>", buf_size, mRunId, mLvl);
     });
 }
 
@@ -181,7 +181,7 @@ MergeAlgorithm::merge_pass(unsigned lvl,
       return mRunReader.invoke_on(shard_idx, [&](RunReaderService& r) {
         unsigned run_lvl = lvl - 1,
                  run_id = assigned_ids[seastar::engine().cpu_id() - 1];
-        task_logger.info("opening file for the run {}/{}", run_lvl, run_id);
+        task_logger.info("opening file for the run <id {}, level {}>", run_id, run_lvl);
         return r.open_run_file(run_filename(mTempPath, run_lvl, run_id));
       });
     })
