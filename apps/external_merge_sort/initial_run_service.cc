@@ -22,6 +22,7 @@ InitialRunService::InitialRunService(seastar::file_handle fd,
   , mRunCount(round_up_int_div(input_fd_size, mAlignedCpuMemSize))
   , mTempBuf(OUT_BUF_SIZE)
   , mTempPath(std::move(temp_path))
+  , mInputFdSize(input_fd_size)
 {}
 
 seastar::future<>
@@ -37,15 +38,27 @@ InitialRunService::start()
     [this] { return mCurrentRunId >= mRunCount; },
     [this] {
       mWritePos = 0;
+
+      std::size_t const default_run_end_pos =
+        mCurrentRunId * mAlignedCpuMemSize + mAlignedCpuMemSize;
+
+      std::size_t const buf_size = mInputFdSize >= default_run_end_pos
+                                     ? mAlignedCpuMemSize
+                                     : mInputFdSize % mAlignedCpuMemSize;
+
       task_logger.info("Initializing run {}. Reading {} bytes at the offset "
                        "{} from the input file.",
                        mCurrentRunId,
-                       mAlignedCpuMemSize,
+                       buf_size,
                        mCurrentRunId * mAlignedCpuMemSize);
       return mInputFile
         .dma_read<record_underlying_type>(mCurrentRunId * mAlignedCpuMemSize,
-                                          mAlignedCpuMemSize)
-        .then([this](auto buf) { return create_initial_run(std::move(buf)); });
+                                          buf_size)
+        .then([this](auto buf) { return create_initial_run(std::move(buf)); })
+        .handle_exception([](auto ex) {
+          task_logger.error("Exception during creation of an initial run: {}",
+                            ex);
+        });
     });
 }
 

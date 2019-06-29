@@ -34,6 +34,8 @@ class InitialRunService
 
   seastar::sstring mTempPath;
 
+  std::size_t mInputFdSize;
+
   static constexpr size_t OUT_BUF_SIZE =
     align_to_record_size(32u * seastar::MB);
 

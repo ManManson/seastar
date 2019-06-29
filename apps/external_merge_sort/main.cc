@@ -54,6 +54,7 @@ main(int argc, char** argv)
                  per_cpu_memory,
                  per_cpu_memory / seastar::MB);
 
+#ifdef SEASTAR_DEFAULT_ALLOCATOR
       // On my machine Seastar reports that each core has 1GB free memory.
       // leave 64MB for temporary buffers and also reserve a little bit more
       // to be sure that we don't hit the limit while allocating supplementary
@@ -61,6 +62,14 @@ main(int argc, char** argv)
       float const cpu_mem_threshold = 0.8f;
       std::size_t const aligned_cpu_mem = align_to_record_size(
         static_cast<std::size_t>(cpu_mem_threshold * per_cpu_memory));
+#else
+      // It turns out that Seastar's custom allocator doesn't like very large
+      // contiguous allocations, so reserve only a small fraction of each core
+      // memory for internal sorting and reading buffers. Could not determine
+      // exact limits, so take a value that is almost guaranteed to be safe.
+      std::size_t const aligned_cpu_mem =
+        align_to_record_size(128u * seastar::MB);
+#endif
       fmt::print("Reserved per-cpu memory size: {} bytes ({} MB)\n"
                  "------\n",
                  aligned_cpu_mem,
