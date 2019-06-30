@@ -25,10 +25,9 @@ class DataFragment;
 
 class MergeAlgorithm
 {
-  using priority_queue_type = std::priority_queue<
-    std::pair<record_underlying_type const*, RunReaderService*>,
-    std::vector<std::pair<record_underlying_type const*, RunReaderService*>>,
-    inverse_record_compare>;
+  using priority_queue_type = std::priority_queue<priorq_element,
+                                                  std::vector<priorq_element>,
+                                                  inverse_record_compare>;
 
   priority_queue_type mPq;
 
@@ -56,29 +55,33 @@ private:
   ///
   class TempBufferWriter
   {
+    static constexpr std::size_t OUT_BUF_SIZE =
+      align_to_record_size(32u * seastar::MB);
+
     // output file handle to be populated from the internal buffer
     seastar::file& mOutputFile;
     // temporary buffer to support chunked output to the file
-    // gets filled in `pq_consume_fragment` calls
-    seastar::temporary_buffer<record_underlying_type> const& mBuf;
+    seastar::temporary_buffer<record_underlying_type> mBuf;
     // current merging pass level and run id for logging
     unsigned mLvl;
     unsigned mRunId;
     // output file write offset and buffer write
     uint64_t& mOutFileWritePos;
     // current buffer end position, gets zero'ed after successful flush to file
-    uint64_t& mBufWritePos;
+    uint64_t mBufWritePos;
 
   public:
-    TempBufferWriter(
-      seastar::file& out,
-      seastar::temporary_buffer<record_underlying_type> const& buf,
-      unsigned lvl,
-      unsigned run_id,
-      uint64_t& outfile_write_pos,
-      uint64_t& buf_write_pos);
+    TempBufferWriter(seastar::file& out,
+                     unsigned lvl,
+                     unsigned run_id,
+                     uint64_t& outfile_write_pos);
 
-    seastar::future<> write(std::size_t buf_size);
+    seastar::future<> write();
+
+    void append_record(record_underlying_type const* rec_ptr);
+
+    bool is_full() const;
+    bool is_empty() const;
   };
 
   // single merge pass (merge `assigned_ids` files to one new larger file)

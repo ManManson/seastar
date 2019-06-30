@@ -85,37 +85,56 @@ MergeAlgorithm::merge()
     .wait();
 }
 
-MergeAlgorithm::TempBufferWriter::TempBufferWriter(
-  seastar::file& out,
-  seastar::temporary_buffer<record_underlying_type> const& buf,
-  unsigned lvl,
-  unsigned run_id,
-  uint64_t& outfile_write_pos,
-  uint64_t& buf_write_pos)
+MergeAlgorithm::TempBufferWriter::TempBufferWriter(seastar::file& out,
+                                                   unsigned lvl,
+                                                   unsigned run_id,
+                                                   uint64_t& outfile_write_pos)
   : mOutputFile(out)
-  , mBuf(buf)
+  , mBuf(OUT_BUF_SIZE)
   , mLvl(lvl)
   , mRunId(run_id)
   , mOutFileWritePos(outfile_write_pos)
-  , mBufWritePos(buf_write_pos)
+  , mBufWritePos(0u)
 {}
 
 seastar::future<>
-MergeAlgorithm::TempBufferWriter::write(std::size_t buf_size)
+MergeAlgorithm::TempBufferWriter::write()
 {
+  auto old_buf_write_pos = mBufWritePos;
   return mOutputFile
-    .dma_write<record_underlying_type>(mOutFileWritePos, mBuf.get(), buf_size)
+    .dma_write<record_underlying_type>(
+      mOutFileWritePos, mBuf.get(), mBufWritePos)
     .then([this](std::size_t written) {
       mOutFileWritePos += written;
       mBufWritePos = 0u;
     })
     .then([this] { return mOutputFile.flush(); })
-    .then([this, buf_size] {
+    .then([this, old_buf_write_pos] {
       task_logger.info("Written {} bytes to the run <id {}, level {}>",
-                       buf_size,
+                       old_buf_write_pos,
                        mRunId,
                        mLvl);
     });
+}
+
+bool
+MergeAlgorithm::TempBufferWriter::is_full() const
+{
+  return mBufWritePos == OUT_BUF_SIZE;
+}
+
+bool
+MergeAlgorithm::TempBufferWriter::is_empty() const
+{
+  return mBufWritePos == 0u;
+}
+
+void
+MergeAlgorithm::TempBufferWriter::append_record(
+  record_underlying_type const* rec_ptr)
+{
+  std::copy(rec_ptr, rec_ptr + RECORD_SIZE, mBuf.get_write() + mBufWritePos);
+  mBufWritePos += RECORD_SIZE;
 }
 
 void
@@ -124,9 +143,6 @@ MergeAlgorithm::merge_pass(unsigned lvl,
                            std::vector<unsigned> const& assigned_ids,
                            std::size_t run_size)
 {
-  static constexpr size_t OUT_BUF_SIZE =
-    align_to_record_size(32u * seastar::MB);
-
   std::size_t const readers_count = assigned_ids.size();
 
   std::vector<seastar::lw_shared_ptr<RunReaderService>> run_readers_vector;
@@ -134,9 +150,6 @@ MergeAlgorithm::merge_pass(unsigned lvl,
 
   auto const reader_shard_indices =
     boost::irange(static_cast<size_t>(0u), readers_count);
-
-  seastar::temporary_buffer<record_underlying_type> out_buf(OUT_BUF_SIZE);
-  uint64_t buf_write_pos = 0u;
 
   seastar::file output_file =
     seastar::open_file_dma(run_filename(mTempPath, lvl, current_run_id),
@@ -146,12 +159,8 @@ MergeAlgorithm::merge_pass(unsigned lvl,
       .get0();
   uint64_t outfile_write_pos = 0u;
 
-  TempBufferWriter buf_writer(output_file,
-                              out_buf,
-                              lvl,
-                              current_run_id,
-                              outfile_write_pos,
-                              buf_write_pos);
+  TempBufferWriter buf_writer(
+    output_file, lvl, current_run_id, outfile_write_pos);
 
   // create a reader for each assigned id
   for (auto i : reader_shard_indices) {
@@ -161,9 +170,17 @@ MergeAlgorithm::merge_pass(unsigned lvl,
 
     auto r = seastar::make_lw_shared<RunReaderService>(
       align_to_record_size(mPerCpuMemory / 31));
-    r->open_run_file(run_filename(mTempPath, run_lvl, run_id)).wait();
-    r->fetch_data().wait();
-    run_readers_vector.push_back(std::move(r));
+    seastar::do_with(
+      std::move(r),
+      [this, &run_readers_vector, run_lvl, run_id](auto& reader_ptr) {
+        return reader_ptr
+          ->open_run_file(run_filename(mTempPath, run_lvl, run_id))
+          .then([&reader_ptr] { return reader_ptr->fetch_data(); })
+          .then([&run_readers_vector, &reader_ptr] {
+            run_readers_vector.push_back(std::move(reader_ptr));
+          });
+      })
+      .wait();
   }
 
   // get a record from each reader and push into pq
@@ -173,12 +190,7 @@ MergeAlgorithm::merge_pass(unsigned lvl,
 
   while (run_readers_vector.size() > 1u) {
     auto min_element = mPq.top();
-
-    std::copy(min_element.first,
-              min_element.first + RECORD_SIZE,
-              out_buf.get_write() + buf_write_pos);
-    buf_write_pos += RECORD_SIZE;
-
+    buf_writer.append_record(min_element.first);
     mPq.pop();
 
     min_element.second->advance_record_in_fragment();
@@ -198,9 +210,8 @@ MergeAlgorithm::merge_pass(unsigned lvl,
     }
 
     // write back to file if the buffer is full
-    if (buf_write_pos == OUT_BUF_SIZE) {
-      buf_writer.write(OUT_BUF_SIZE).wait();
-    }
+    if (buf_writer.is_full())
+      buf_writer.write().wait();
   }
 
   // write back to file if there is anything left in the last reader
@@ -211,17 +222,13 @@ MergeAlgorithm::merge_pass(unsigned lvl,
                                *fragment_end = last_fragment.mBeginPtr +
                                                last_fragment.mDataSize;
   while (remaining_recs_ptr != fragment_end) {
-    std::copy(remaining_recs_ptr,
-              remaining_recs_ptr + RECORD_SIZE,
-              out_buf.get_write() + buf_write_pos);
-    buf_write_pos += RECORD_SIZE;
-    if (buf_write_pos == OUT_BUF_SIZE) {
-      buf_writer.write(OUT_BUF_SIZE).wait();
-    }
+    buf_writer.append_record(remaining_recs_ptr);
+    if (buf_writer.is_full())
+      buf_writer.write().wait();
     remaining_recs_ptr += RECORD_SIZE;
   }
-  if (buf_write_pos != 0u) {
-    buf_writer.write(buf_write_pos).wait();
+  if (!buf_writer.is_empty()) {
+    buf_writer.write().wait();
   }
   last_reader->remove_run_file().wait();
 

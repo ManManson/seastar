@@ -1,5 +1,7 @@
 #pragma once
 
+#include <utility>
+
 #include "utils.hh"
 
 struct record_compare
@@ -10,10 +12,10 @@ struct record_compare
 
 class RunReaderService;
 
+using priorq_element =
+  std::pair<record_underlying_type const*, RunReaderService*>;
+
 struct inverse_record_compare
 {
-  bool operator()(
-    std::pair<record_underlying_type const*, RunReaderService*> const& lhs,
-    std::pair<record_underlying_type const*, RunReaderService*> const& rhs)
-    const;
+  bool operator()(priorq_element const& lhs, priorq_element const& rhs) const;
 };
