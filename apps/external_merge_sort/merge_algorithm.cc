@@ -213,12 +213,20 @@ MergeAlgorithm::merge_pass(unsigned lvl,
                                  last_reader->current_record_in_fragment(),
                                *fragment_end = last_fragment.mBeginPtr +
                                                last_fragment.mDataSize;
-  while (remaining_recs_ptr != fragment_end) {
-    buf_writer.append_record(remaining_recs_ptr);
-    if (buf_writer.is_full())
-      buf_writer.write().wait();
-    remaining_recs_ptr += RECORD_SIZE;
-  }
+
+  seastar::do_until(
+    [&remaining_recs_ptr, fragment_end] {
+      return remaining_recs_ptr == fragment_end;
+    },
+    [&buf_writer, &remaining_recs_ptr] {
+      buf_writer.append_record(remaining_recs_ptr);
+      remaining_recs_ptr += RECORD_SIZE;
+      if (buf_writer.is_full())
+        return buf_writer.write();
+      return seastar::make_ready_future<>();
+    })
+    .wait();
+
   if (!buf_writer.is_empty()) {
     buf_writer.write().wait();
   }
