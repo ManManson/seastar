@@ -66,15 +66,12 @@ private:
     unsigned mLvl;
     unsigned mRunId;
     // output file write offset and buffer write
-    uint64_t& mOutFileWritePos;
+    uint64_t mOutFileWritePos;
     // current buffer end position, gets zero'ed after successful flush to file
     uint64_t mBufWritePos;
 
   public:
-    TempBufferWriter(seastar::file& out,
-                     unsigned lvl,
-                     unsigned run_id,
-                     uint64_t& outfile_write_pos);
+    TempBufferWriter(seastar::file& out, unsigned lvl, unsigned run_id);
 
     seastar::future<> write();
 

@@ -87,13 +87,12 @@ MergeAlgorithm::merge()
 
 MergeAlgorithm::TempBufferWriter::TempBufferWriter(seastar::file& out,
                                                    unsigned lvl,
-                                                   unsigned run_id,
-                                                   uint64_t& outfile_write_pos)
+                                                   unsigned run_id)
   : mOutputFile(out)
   , mBuf(OUT_BUF_SIZE)
   , mLvl(lvl)
   , mRunId(run_id)
-  , mOutFileWritePos(outfile_write_pos)
+  , mOutFileWritePos(0u)
   , mBufWritePos(0u)
 {}
 
@@ -157,10 +156,8 @@ MergeAlgorithm::merge_pass(unsigned lvl,
                              seastar::open_flags::truncate |
                              seastar::open_flags::wo)
       .get0();
-  uint64_t outfile_write_pos = 0u;
 
-  TempBufferWriter buf_writer(
-    output_file, lvl, current_run_id, outfile_write_pos);
+  TempBufferWriter buf_writer(output_file, lvl, current_run_id);
 
   // create a reader for each assigned id
   for (auto i : reader_shard_indices) {
