@@ -38,13 +38,10 @@ main(int argc, char** argv)
     "path to temp directory where intermediate partitions are stored");
 
   seastar::sharded<InitialRunService> init_run_srv;
-  seastar::sharded<RunReaderService> sharded_reader_srv;
   return app.run(argc, argv, [&] {
     return seastar::async([&] {
       seastar::engine().at_exit(
         [&init_run_srv] { return init_run_srv.stop(); });
-      seastar::engine().at_exit(
-        [&sharded_reader_srv] { return sharded_reader_srv.stop(); });
 
       std::size_t const per_cpu_memory = seastar::memory::stats().free_memory();
       fmt::print("------\n"
@@ -132,8 +129,7 @@ main(int argc, char** argv)
                                  input_size,
                                  aligned_cpu_mem,
                                  output_filepath,
-                                 temp_path,
-                                 sharded_reader_srv);
+                                 temp_path);
             malgo.merge();
           });
         })

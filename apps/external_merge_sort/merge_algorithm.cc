@@ -5,28 +5,27 @@
 
 #include "data_fragment.hh"
 #include "merge_algorithm.hh"
+#include "run_reader_service.hh"
 #include "utils.hh"
 
-MergeAlgorithm::MergeAlgorithm(
-  unsigned initial_run_count,
-  std::size_t input_file_size,
-  std::size_t per_cpu_memory,
-  seastar::sstring const& output_filepath,
-  seastar::sstring const& temp_path,
-  seastar::sharded<RunReaderService>& sharded_run_reader)
+MergeAlgorithm::MergeAlgorithm(unsigned initial_run_count,
+                               std::size_t input_file_size,
+                               std::size_t per_cpu_memory,
+                               seastar::sstring const& output_filepath,
+                               seastar::sstring const& temp_path)
   : mInitialRunCount(initial_run_count)
   , mInputFileSize(input_file_size)
   , mPerCpuMemory(per_cpu_memory)
   , mOutputFilepath(output_filepath)
   , mTempPath(temp_path)
-  , mRunReader(sharded_run_reader)
 {}
 
 void
 MergeAlgorithm::merge()
 {
   // K-way merge sort constant
-  const unsigned K = seastar::smp::count - 1;
+  // const unsigned K = seastar::smp::count - 1;
+  const unsigned K = 31; // temporary hardcode for 4GiB test file
 
   // Maximum size of each individual run on the previous level
   std::size_t run_size =
@@ -34,8 +33,6 @@ MergeAlgorithm::merge()
 
   uint32_t lvl = 1u;
   uint32_t prev_lvl_run_count = mInitialRunCount;
-
-  mRunReader.start(mPerCpuMemory).wait();
 
   while (prev_lvl_run_count > 1) {
     task_logger.info("Start merge pass (level {})", lvl);
@@ -114,29 +111,11 @@ MergeAlgorithm::TempBufferWriter::write(std::size_t buf_size)
     })
     .then([this] { return mOutputFile.flush(); })
     .then([this, buf_size] {
-      task_logger.info(
-        "writing {} bytes to the run <id {}, level {}>", buf_size, mRunId, mLvl);
+      task_logger.info("Written {} bytes to the run <id {}, level {}>",
+                       buf_size,
+                       mRunId,
+                       mLvl);
     });
-}
-
-seastar::future<DataFragment>
-MergeAlgorithm::fetch_and_get_data(unsigned shard_idx)
-{
-  return mRunReader
-    .invoke_on(shard_idx, [](RunReaderService& r) { return r.fetch_data(); })
-    .then([this, shard_idx] {
-      return mRunReader.invoke_on(
-        shard_idx, [](RunReaderService& r) { return r.data_fragment(); });
-    });
-}
-
-void
-MergeAlgorithm::pq_consume_fragment(DataFragment const& frag)
-{
-  for (uint64_t fragment_pos = 0u; fragment_pos < frag.mDataSize;
-       fragment_pos += RECORD_SIZE) {
-    mPq.push(frag.mBeginPtr + fragment_pos);
-  }
 }
 
 void
@@ -150,9 +129,11 @@ MergeAlgorithm::merge_pass(unsigned lvl,
 
   std::size_t const readers_count = assigned_ids.size();
 
-  // shift indices by 1 since we want to skip zero-th shard from reading
+  std::vector<seastar::lw_shared_ptr<RunReaderService>> run_readers_vector;
+  run_readers_vector.reserve(readers_count);
+
   auto const reader_shard_indices =
-    boost::irange(static_cast<size_t>(1u), readers_count + 1);
+    boost::irange(static_cast<size_t>(0u), readers_count);
 
   seastar::temporary_buffer<record_underlying_type> out_buf(OUT_BUF_SIZE);
   uint64_t buf_write_pos = 0u;
@@ -172,96 +153,77 @@ MergeAlgorithm::merge_pass(unsigned lvl,
                               outfile_write_pos,
                               buf_write_pos);
 
-  bool nothing_to_fetch = false;
+  // create a reader for each assigned id
+  for (auto i : reader_shard_indices) {
+    unsigned run_lvl = lvl - 1, run_id = assigned_ids[i];
+    task_logger.info(
+      "opening file for the run <id {}, level {}>", run_id, run_lvl);
 
-  // open assigned file ids
-  seastar::parallel_for_each(
-    reader_shard_indices,
-    [this, &assigned_ids, lvl](unsigned shard_idx) {
-      return mRunReader.invoke_on(shard_idx, [&](RunReaderService& r) {
-        unsigned run_lvl = lvl - 1,
-                 run_id = assigned_ids[seastar::engine().cpu_id() - 1];
-        task_logger.info("opening file for the run <id {}, level {}>", run_id, run_lvl);
-        return r.open_run_file(run_filename(mTempPath, run_lvl, run_id));
-      });
-    })
-    .then([&] {
-      // while there is something to process in at least one reader
-      // and we've not hit the size limit for the newly generated run
-      return seastar::do_until(
-               [&nothing_to_fetch,
-                &outfile_write_pos,
-                run_size,
-                readers_count] {
-                 return nothing_to_fetch ||
-                        (outfile_write_pos >= run_size * readers_count);
-               },
-               [&] {
-                 return seastar::do_for_each(
-                          reader_shard_indices,
-                          [&](unsigned shard_idx) {
-                            // fetch data and retrieve corresponding data
-                            // fragment pointing to the available data on
-                            // the shard
-                            return fetch_and_get_data(shard_idx).then(
-                              [this](DataFragment const& frag) {
-                                // skip the reader if there is no data, it has
-                                // definitely reached EOF
-                                if (frag.mDataSize == 0)
-                                  return seastar::make_ready_future<>();
+    auto r = seastar::make_lw_shared<RunReaderService>(
+      align_to_record_size(mPerCpuMemory / 31));
+    r->open_run_file(run_filename(mTempPath, run_lvl, run_id)).wait();
+    r->fetch_data().wait();
+    run_readers_vector.push_back(std::move(r));
+  }
 
-                                // sort data locally on zero-th core
-                                pq_consume_fragment(frag);
+  // get a record from each reader and push into pq
+  for (auto const& reader_ptr : run_readers_vector) {
+    mPq.push({ reader_ptr->current_record_in_fragment(), reader_ptr.get() });
+  }
 
-                                return seastar::make_ready_future<>();
-                              });
-                          })
-                   .then([&] {
-                     if (mPq.empty()) {
-                       nothing_to_fetch = true;
-                       return seastar::make_ready_future<>();
-                     }
+  while (run_readers_vector.size() > 1u) {
+    auto min_element = mPq.top();
 
-                     // flush priority queue to the output buffer and then
-                     // to the file (in chunks)
-                     return seastar::do_until(
-                              [this] { return mPq.empty(); },
-                              [&] {
-                                record_underlying_type const* rec_ptr =
-                                  mPq.top();
-                                std::copy(rec_ptr,
-                                          rec_ptr + RECORD_SIZE,
-                                          out_buf.get_write() + buf_write_pos);
-                                buf_write_pos += RECORD_SIZE;
-                                mPq.pop();
-                                // flush full output buffer contents to the
-                                // output file
-                                if (buf_write_pos == OUT_BUF_SIZE) {
-                                  return buf_writer.write(OUT_BUF_SIZE);
-                                }
-                                return seastar::make_ready_future<>();
-                              })
-                       .then([&] {
-                         // flush remaining part of the output buffer
-                         // to the file
-                         if (buf_write_pos != 0) {
-                           return buf_writer.write(buf_write_pos);
-                         }
-                         return seastar::make_ready_future<>();
-                       });
-                   });
-               })
-        .then([&output_file] { return output_file.close(); })
-        .then([this, reader_shard_indices] {
-          // remove exhausted run files that participated in this merge
-          // operation
-          return seastar::parallel_for_each(
-            reader_shard_indices, [this](unsigned shard_idx) {
-              return mRunReader.invoke_on(shard_idx, [](RunReaderService& r) {
-                return r.remove_run_file();
-              });
-            });
-        });
-    })
-    .wait();
+    std::copy(min_element.first,
+              min_element.first + RECORD_SIZE,
+              out_buf.get_write() + buf_write_pos);
+    buf_write_pos += RECORD_SIZE;
+
+    mPq.pop();
+
+    min_element.second->advance_record_in_fragment();
+
+    if (min_element.second->has_more()) {
+      mPq.push({ min_element.second->current_record_in_fragment(),
+                 min_element.second });
+    } else {
+      // if reader with `just extracted min element` is exhausted
+      auto reader_to_erase = std::find_if(
+        run_readers_vector.begin(),
+        run_readers_vector.end(),
+        [v = min_element.second](auto const& x) { return x.get() == v; });
+      (*reader_to_erase)->remove_run_file().wait();
+      // exclude it from the processing list
+      run_readers_vector.erase(reader_to_erase);
+    }
+
+    // write back to file if the buffer is full
+    if (buf_write_pos == OUT_BUF_SIZE) {
+      buf_writer.write(OUT_BUF_SIZE).wait();
+    }
+  }
+
+  // write back to file if there is anything left in the last reader
+  auto const& last_reader = run_readers_vector.front();
+  DataFragment const last_fragment = last_reader->data_fragment();
+  record_underlying_type const *remaining_recs_ptr =
+                                 last_reader->current_record_in_fragment(),
+                               *fragment_end = last_fragment.mBeginPtr +
+                                               last_fragment.mDataSize;
+  while (remaining_recs_ptr != fragment_end) {
+    std::copy(remaining_recs_ptr,
+              remaining_recs_ptr + RECORD_SIZE,
+              out_buf.get_write() + buf_write_pos);
+    buf_write_pos += RECORD_SIZE;
+    if (buf_write_pos == OUT_BUF_SIZE) {
+      buf_writer.write(OUT_BUF_SIZE).wait();
+    }
+    remaining_recs_ptr += RECORD_SIZE;
+  }
+  if (buf_write_pos != 0u) {
+    buf_writer.write(buf_write_pos).wait();
+  }
+  last_reader->remove_run_file().wait();
+
+  output_file.close().wait();
 }

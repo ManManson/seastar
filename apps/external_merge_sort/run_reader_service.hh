@@ -6,11 +6,10 @@
 
 #include "utils.hh"
 
-#include <stdint.h>
 #include <cstddef>
+#include <stdint.h>
 
-namespace seastar
-{
+namespace seastar {
 
 template<typename... T>
 class future;
@@ -28,9 +27,11 @@ class RunReaderService
   seastar::file mFd;
   seastar::sstring mFilePath;
   seastar::temporary_buffer<record_underlying_type> mBuf;
-  uint64_t mCurrentReadPos = 0;
+  uint64_t mCurrentReadPos = 0u;
   std::size_t mActualBufSize = 0u;
   std::size_t mAlignedCpuMemSize;
+
+  uint64_t mDataFragmentReadPos = 0u;
 
 public:
   RunReaderService(std::size_t mem);
@@ -43,4 +44,8 @@ public:
 
   seastar::future<> fetch_data();
   DataFragment data_fragment();
+
+  const record_underlying_type* current_record_in_fragment() const;
+  void advance_record_in_fragment();
+  bool has_more() const;
 };

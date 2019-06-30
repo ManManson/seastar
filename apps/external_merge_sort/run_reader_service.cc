@@ -55,6 +55,7 @@ RunReaderService::fetch_data()
       mBuf = std::move(buf);
       mActualBufSize = mBuf.size();
       mCurrentReadPos += mActualBufSize;
+      mDataFragmentReadPos = 0u;
     });
 }
 
@@ -62,4 +63,24 @@ DataFragment
 RunReaderService::data_fragment()
 {
   return DataFragment{ mBuf.get(), mActualBufSize };
+}
+const record_underlying_type*
+RunReaderService::current_record_in_fragment() const
+{
+  return mBuf.get() + mDataFragmentReadPos;
+}
+
+void
+RunReaderService::advance_record_in_fragment()
+{
+  mDataFragmentReadPos += RECORD_SIZE;
+  if (mDataFragmentReadPos == mActualBufSize) {
+    fetch_data().wait();
+  }
+}
+
+bool
+RunReaderService::has_more() const
+{
+  return mActualBufSize != 0u;
 }

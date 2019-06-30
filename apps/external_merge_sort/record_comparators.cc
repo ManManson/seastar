@@ -9,9 +9,10 @@ record_compare::operator()(record_underlying_type const* lhs,
 }
 
 bool
-inverse_record_compare::operator()(record_underlying_type const* lhs,
-                                   record_underlying_type const* rhs) const
+inverse_record_compare::operator()(
+  std::pair<record_underlying_type const*, RunReaderService*> const& lhs,
+  std::pair<record_underlying_type const*, RunReaderService*> const& rhs) const
 {
   return std::lexicographical_compare(
-    rhs, rhs + RECORD_SIZE, lhs, lhs + RECORD_SIZE);
+    rhs.first, rhs.first + RECORD_SIZE, lhs.first, lhs.first + RECORD_SIZE);
 }
