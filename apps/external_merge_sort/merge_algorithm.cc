@@ -177,7 +177,7 @@ MergeAlgorithm::merge_pass(unsigned lvl,
 
   // get a record from each reader and push into pq
   for (auto const& reader_ptr : run_readers_vector) {
-    mPq.push({ reader_ptr->current_record_in_fragment(), reader_ptr.get() });
+    mPq.push({ reader_ptr->current_record_in_fragment(), reader_ptr });
   }
 
   while (run_readers_vector.size() > 1u) {
@@ -195,7 +195,7 @@ MergeAlgorithm::merge_pass(unsigned lvl,
       auto reader_to_erase = std::find_if(
         run_readers_vector.begin(),
         run_readers_vector.end(),
-        [v = min_element.second](auto const& x) { return x.get() == v; });
+        [v = min_element.second](auto const& x) { return x == v; });
       (*reader_to_erase)->remove_run_file().wait();
       // exclude it from the processing list
       run_readers_vector.erase(reader_to_erase);

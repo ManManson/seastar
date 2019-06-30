@@ -4,6 +4,13 @@
 
 #include "utils.hh"
 
+namespace seastar {
+
+template<typename T>
+class lw_shared_ptr;
+
+} // namespace seastar
+
 struct record_compare
 {
   bool operator()(record_underlying_type const* lhs,
@@ -12,8 +19,8 @@ struct record_compare
 
 class RunReaderService;
 
-using priorq_element =
-  std::pair<record_underlying_type const*, RunReaderService*>;
+using priorq_element = std::pair<record_underlying_type const*,
+                                 seastar::lw_shared_ptr<RunReaderService>>;
 
 struct inverse_record_compare
 {
