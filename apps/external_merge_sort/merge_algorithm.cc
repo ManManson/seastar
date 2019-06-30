@@ -142,13 +142,8 @@ MergeAlgorithm::merge_pass(unsigned lvl,
                            std::vector<unsigned> const& assigned_ids,
                            std::size_t run_size)
 {
-  std::size_t const readers_count = assigned_ids.size();
-
   std::vector<seastar::lw_shared_ptr<RunReaderService>> run_readers_vector;
-  run_readers_vector.reserve(readers_count);
-
-  auto const reader_shard_indices =
-    boost::irange(static_cast<size_t>(0u), readers_count);
+  run_readers_vector.reserve(assigned_ids.size());
 
   seastar::file output_file =
     seastar::open_file_dma(run_filename(mTempPath, lvl, current_run_id),
@@ -160,8 +155,8 @@ MergeAlgorithm::merge_pass(unsigned lvl,
   TempBufferWriter buf_writer(output_file, lvl, current_run_id);
 
   // create a reader for each assigned id
-  for (auto i : reader_shard_indices) {
-    unsigned run_lvl = lvl - 1, run_id = assigned_ids[i];
+  for (unsigned run_id : assigned_ids) {
+    unsigned run_lvl = lvl - 1;
     task_logger.info(
       "opening file for the run <id {}, level {}>", run_id, run_lvl);
 
