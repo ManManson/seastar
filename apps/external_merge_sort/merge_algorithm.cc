@@ -142,8 +142,8 @@ MergeAlgorithm::merge_pass(unsigned lvl,
                            std::vector<unsigned> const& assigned_ids,
                            std::size_t run_size)
 {
-  std::vector<seastar::lw_shared_ptr<RunReaderService>> run_readers_vector;
-  run_readers_vector.reserve(assigned_ids.size());
+  std::vector<seastar::lw_shared_ptr<RunReaderService>> run_readers;
+  run_readers.reserve(assigned_ids.size());
 
   seastar::file output_file =
     seastar::open_file_dma(run_filename(mTempPath, lvl, current_run_id),
@@ -157,7 +157,7 @@ MergeAlgorithm::merge_pass(unsigned lvl,
   // create a reader for each assigned id
   seastar::do_for_each(
     assigned_ids,
-    [this, &run_readers_vector, lvl](unsigned run_id) {
+    [this, &run_readers, lvl](unsigned run_id) {
       unsigned run_lvl = lvl - 1;
       task_logger.info(
         "opening file for the run <id {}, level {}>", run_id, run_lvl);
@@ -166,13 +166,12 @@ MergeAlgorithm::merge_pass(unsigned lvl,
         align_to_record_size(mPerCpuMemory / 31));
 
       return seastar::do_with(
-        std::move(r),
-        [this, &run_readers_vector, run_lvl, run_id](auto& reader_ptr) {
+        std::move(r), [this, &run_readers, run_lvl, run_id](auto& reader_ptr) {
           return reader_ptr
             ->open_run_file(run_filename(mTempPath, run_lvl, run_id))
             .then([&reader_ptr] { return reader_ptr->fetch_data(); })
-            .then([&run_readers_vector, &reader_ptr] {
-              run_readers_vector.push_back(std::move(reader_ptr));
+            .then([&run_readers, &reader_ptr] {
+              run_readers.push_back(std::move(reader_ptr));
             });
         });
     })
@@ -180,40 +179,45 @@ MergeAlgorithm::merge_pass(unsigned lvl,
 
   // get a record from each reader and push into pq
   seastar::do_for_each(
-    run_readers_vector,
+    run_readers,
     [this](auto const& reader_ptr) {
       mPq.push({ reader_ptr->current_record_in_fragment(), reader_ptr });
     })
     .wait();
 
-  while (run_readers_vector.size() > 1u) {
-    auto min_element = mPq.top();
-    buf_writer.append_record(min_element.first);
-    mPq.pop();
+  seastar::do_until(
+    [&run_readers] { return run_readers.size() <= 1u; },
+    [this, &buf_writer, &run_readers] {
+      return seastar::async([this, &buf_writer, &run_readers] {
+        auto min_element = mPq.top();
+        buf_writer.append_record(min_element.first);
+        mPq.pop();
 
-    min_element.second->advance_record_in_fragment();
+        min_element.second->advance_record_in_fragment();
 
-    if (min_element.second->has_more()) {
-      mPq.push({ min_element.second->current_record_in_fragment(),
-                 min_element.second });
-    } else {
-      // if reader with `just extracted min element` is exhausted
-      auto reader_to_erase = std::find_if(
-        run_readers_vector.begin(),
-        run_readers_vector.end(),
-        [v = min_element.second](auto const& x) { return x == v; });
-      (*reader_to_erase)->remove_run_file().wait();
-      // exclude it from the processing list
-      run_readers_vector.erase(reader_to_erase);
-    }
+        if (min_element.second->has_more()) {
+          mPq.push({ min_element.second->current_record_in_fragment(),
+                     min_element.second });
+        } else {
+          // if reader with `just extracted min element` is exhausted
+          auto reader_to_erase = std::find_if(
+            run_readers.begin(),
+            run_readers.end(),
+            [v = min_element.second](auto const& x) { return x == v; });
+          (*reader_to_erase)->remove_run_file().wait();
+          // exclude it from the processing list
+          run_readers.erase(reader_to_erase);
+        }
 
-    // write back to file if the buffer is full
-    if (buf_writer.is_full())
-      buf_writer.write().wait();
-  }
+        // write back to file if the buffer is full
+        if (buf_writer.is_full())
+          buf_writer.write().wait();
+      });
+    })
+    .wait();
 
   // write back to file if there is anything left in the last reader
-  auto const& last_reader = run_readers_vector.front();
+  auto const& last_reader = run_readers.front();
   DataFragment const last_fragment = last_reader->data_fragment();
   record_underlying_type const *remaining_recs_ptr =
                                  last_reader->current_record_in_fragment(),
