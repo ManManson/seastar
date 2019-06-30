@@ -155,30 +155,36 @@ MergeAlgorithm::merge_pass(unsigned lvl,
   TempBufferWriter buf_writer(output_file, lvl, current_run_id);
 
   // create a reader for each assigned id
-  for (unsigned run_id : assigned_ids) {
-    unsigned run_lvl = lvl - 1;
-    task_logger.info(
-      "opening file for the run <id {}, level {}>", run_id, run_lvl);
+  seastar::do_for_each(
+    assigned_ids,
+    [this, &run_readers_vector, lvl](unsigned run_id) {
+      unsigned run_lvl = lvl - 1;
+      task_logger.info(
+        "opening file for the run <id {}, level {}>", run_id, run_lvl);
 
-    auto r = seastar::make_lw_shared<RunReaderService>(
-      align_to_record_size(mPerCpuMemory / 31));
-    seastar::do_with(
-      std::move(r),
-      [this, &run_readers_vector, run_lvl, run_id](auto& reader_ptr) {
-        return reader_ptr
-          ->open_run_file(run_filename(mTempPath, run_lvl, run_id))
-          .then([&reader_ptr] { return reader_ptr->fetch_data(); })
-          .then([&run_readers_vector, &reader_ptr] {
-            run_readers_vector.push_back(std::move(reader_ptr));
-          });
-      })
-      .wait();
-  }
+      auto r = seastar::make_lw_shared<RunReaderService>(
+        align_to_record_size(mPerCpuMemory / 31));
+
+      return seastar::do_with(
+        std::move(r),
+        [this, &run_readers_vector, run_lvl, run_id](auto& reader_ptr) {
+          return reader_ptr
+            ->open_run_file(run_filename(mTempPath, run_lvl, run_id))
+            .then([&reader_ptr] { return reader_ptr->fetch_data(); })
+            .then([&run_readers_vector, &reader_ptr] {
+              run_readers_vector.push_back(std::move(reader_ptr));
+            });
+        });
+    })
+    .wait();
 
   // get a record from each reader and push into pq
-  for (auto const& reader_ptr : run_readers_vector) {
-    mPq.push({ reader_ptr->current_record_in_fragment(), reader_ptr });
-  }
+  seastar::do_for_each(
+    run_readers_vector,
+    [this](auto const& reader_ptr) {
+      mPq.push({ reader_ptr->current_record_in_fragment(), reader_ptr });
+    })
+    .wait();
 
   while (run_readers_vector.size() > 1u) {
     auto min_element = mPq.top();
