@@ -175,74 +175,75 @@ MergeAlgorithm::merge_pass(unsigned lvl,
             });
         });
     })
-    .wait();
-
-  // get a record from each reader and push into pq
-  seastar::do_for_each(
-    run_readers,
-    [this](auto const& reader_ptr) {
-      mPq.push({ reader_ptr->current_record_in_fragment(), reader_ptr });
-    })
-    .wait();
-
-  seastar::do_until(
-    [&run_readers] { return run_readers.size() <= 1u; },
-    [this, &buf_writer, &run_readers] {
-      return seastar::async([this, &buf_writer, &run_readers] {
-        auto min_element = mPq.top();
-        buf_writer.append_record(min_element.first);
-        mPq.pop();
-
-        min_element.second->advance_record_in_fragment();
-
-        if (min_element.second->has_more()) {
-          mPq.push({ min_element.second->current_record_in_fragment(),
-                     min_element.second });
-        } else {
-          // if reader with `just extracted min element` is exhausted
-          auto reader_to_erase = std::find_if(
-            run_readers.begin(),
-            run_readers.end(),
-            [v = min_element.second](auto const& x) { return x == v; });
-          (*reader_to_erase)->remove_run_file().wait();
-          // exclude it from the processing list
-          run_readers.erase(reader_to_erase);
-        }
-
-        // write back to file if the buffer is full
-        if (buf_writer.is_full())
-          buf_writer.write().wait();
+    .then([this, &run_readers] {
+      // get a record from each reader and push into pq
+      return seastar::do_for_each(run_readers, [this](auto const& reader_ptr) {
+        mPq.push({ reader_ptr->current_record_in_fragment(), reader_ptr });
       });
     })
-    .then([&run_readers, &buf_writer] {
-      return seastar::async([&run_readers, &buf_writer] {
-        // write back to file if there is anything left in the last reader
-        auto const& last_reader = run_readers.front();
-        DataFragment const last_fragment = last_reader->data_fragment();
-        record_underlying_type const
-          *remaining_recs_ptr = last_reader->current_record_in_fragment(),
-          *fragment_end = last_fragment.mBeginPtr + last_fragment.mDataSize;
+    .then([this, &run_readers, &buf_writer] {
+      return seastar::do_until(
+               [&run_readers] { return run_readers.size() <= 1u; },
+               [this, &buf_writer, &run_readers] {
+                 return seastar::async([this, &buf_writer, &run_readers] {
+                   auto min_element = mPq.top();
+                   buf_writer.append_record(min_element.first);
+                   mPq.pop();
 
-        seastar::do_until(
-          [&remaining_recs_ptr, fragment_end] {
-            return remaining_recs_ptr == fragment_end;
-          },
-          [&buf_writer, &remaining_recs_ptr] {
-            buf_writer.append_record(remaining_recs_ptr);
-            remaining_recs_ptr += RECORD_SIZE;
-            if (buf_writer.is_full())
-              return buf_writer.write();
-            return seastar::make_ready_future<>();
-          })
-          .then([&buf_writer] {
-            if (!buf_writer.is_empty())
-              return buf_writer.write();
-            return seastar::make_ready_future<>();
-          })
-          .wait();
+                   min_element.second->advance_record_in_fragment();
 
-        last_reader->remove_run_file().wait();
-      });
+                   if (min_element.second->has_more()) {
+                     mPq.push(
+                       { min_element.second->current_record_in_fragment(),
+                         min_element.second });
+                   } else {
+                     // if reader with `just extracted min element` is exhausted
+                     auto reader_to_erase =
+                       std::find_if(run_readers.begin(),
+                                    run_readers.end(),
+                                    [v = min_element.second](auto const& x) {
+                                      return x == v;
+                                    });
+                     (*reader_to_erase)->remove_run_file().wait();
+                     // exclude it from the processing list
+                     run_readers.erase(reader_to_erase);
+                   }
+
+                   // write back to file if the buffer is full
+                   if (buf_writer.is_full())
+                     buf_writer.write().wait();
+                 });
+               })
+        .then([&run_readers, &buf_writer] {
+          return seastar::async([&run_readers, &buf_writer] {
+            // write back to file if there is anything left in the last reader
+            auto const& last_reader = run_readers.front();
+            DataFragment const last_fragment = last_reader->data_fragment();
+            record_underlying_type const
+              *remaining_recs_ptr = last_reader->current_record_in_fragment(),
+              *fragment_end = last_fragment.mBeginPtr + last_fragment.mDataSize;
+
+            seastar::do_until(
+              [&remaining_recs_ptr, fragment_end] {
+                return remaining_recs_ptr == fragment_end;
+              },
+              [&buf_writer, &remaining_recs_ptr] {
+                buf_writer.append_record(remaining_recs_ptr);
+                remaining_recs_ptr += RECORD_SIZE;
+                if (buf_writer.is_full())
+                  return buf_writer.write();
+                return seastar::make_ready_future<>();
+              })
+              .then([&buf_writer] {
+                if (!buf_writer.is_empty())
+                  return buf_writer.write();
+                return seastar::make_ready_future<>();
+              })
+              .wait();
+
+            last_reader->remove_run_file().wait();
+          });
+        });
     })
     .wait();
 }
