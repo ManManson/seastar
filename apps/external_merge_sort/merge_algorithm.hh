@@ -1,7 +1,6 @@
 #pragma once
 
 #include <seastar/core/sharded.hh>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
 

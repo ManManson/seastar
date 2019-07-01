@@ -1,6 +1,7 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
 
 #include "data_fragment.hh"
@@ -24,11 +25,11 @@ MergeAlgorithm::merge(std::size_t per_cpu_memory, unsigned initial_run_count)
   // If so, take mInitialRunCount, else calculate K in a way that ensures that
   // (mPerCpuMemory / K) == 4MiB equals to 4MiB
 
-  unsigned K = initial_run_count;
-  if (align_to_record_size(per_cpu_memory / K) < 4u * seastar::MB) {
-    K = align_to_record_size(per_cpu_memory / (4u * seastar::MB));
-  }
-  // unsigned K = 16;
+  //  unsigned K = initial_run_count;
+  //  if (align_to_record_size(per_cpu_memory / K) < 4u * seastar::MB) {
+  //    K = align_to_record_size(per_cpu_memory / (4u * seastar::MB));
+  //  }
+  unsigned K = 31; // 16
 
   // Maximum size of each individual run on the previous level
   std::size_t run_size =
@@ -44,6 +45,7 @@ MergeAlgorithm::merge(std::size_t per_cpu_memory, unsigned initial_run_count)
     task_logger.info("Start merge pass (level {})", lvl);
 
     // assign unprocessed initial run ids
+
     std::queue<uint32_t> unprocessed_ids;
     for (uint32_t i = 0; i != prev_lvl_run_count; ++i) {
       unprocessed_ids.push(i);
@@ -101,9 +103,8 @@ MergeAlgorithm::merge(std::size_t per_cpu_memory, unsigned initial_run_count)
     .then([] {
       task_logger.info("Successfully moved file to the final destination");
     })
+    .then([&merge_pass] { return merge_pass.stop(); })
     .wait();
-
-  merge_pass.stop().wait();
 }
 
 TempBufferWriter::TempBufferWriter(unsigned lvl, unsigned run_id)
@@ -195,7 +196,7 @@ MergePass::execute(unsigned lvl,
                seastar::open_flags::create | seastar::open_flags::truncate |
                  seastar::open_flags::wo)
         .then([&buf_writer](seastar::file out) {
-          return buf_writer.open_file(out);
+          return buf_writer.open_file(std::move(out));
         })
         .then([this, &buf_writer, &run_readers, &assigned_ids, lvl] {
           // create a reader for each assigned id
@@ -246,7 +247,8 @@ MergePass::execute(unsigned lvl,
 
                              mPq.pop();
 
-                             min_element.second->advance_record_in_fragment();
+                             min_element.second->advance_record_in_fragment()
+                               .wait();
 
                              if (min_element.second->has_more()) {
                                mPq.push({ min_element.second
@@ -268,10 +270,12 @@ MergePass::execute(unsigned lvl,
                              }
                            });
                        })
-                .then([&run_readers, &buf_writer] {
-                  return seastar::async([&run_readers, &buf_writer] {
-                    // write back to file if there is anything left in the last
-                    // reader
+                .then([this, &run_readers, &buf_writer] {
+                  return seastar::async([this, &run_readers, &buf_writer] {
+                    // pop the remaining element from the queue since we are
+                    // going to flush the data in the last reader directly
+                    mPq.pop();
+
                     auto const& last_reader = run_readers.front();
                     DataFragment const last_fragment =
                       last_reader->data_fragment();
@@ -299,8 +303,7 @@ MergePass::execute(unsigned lvl,
                       })
                       .wait();
 
-                    // TODO: this causes crashes on `merge_pass` function
-                    // reentry run_readers.front()->remove_run_file().wait();
+                    last_reader->remove_run_file().wait();
                   });
                 });
             });

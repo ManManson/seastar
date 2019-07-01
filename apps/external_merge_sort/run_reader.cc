@@ -55,7 +55,6 @@ RunReader::fetch_data()
       mBuf = std::move(buf);
       mActualBufSize = mBuf.size();
       mCurrentReadPos += mActualBufSize;
-      mDataFragmentReadPos = 0u;
     });
 }
 
@@ -70,13 +69,15 @@ RunReader::current_record_in_fragment() const
   return mBuf.get() + mDataFragmentReadPos;
 }
 
-void
+seastar::future<>
 RunReader::advance_record_in_fragment()
 {
   mDataFragmentReadPos += RECORD_SIZE;
   if (mDataFragmentReadPos == mActualBufSize) {
-    fetch_data().wait();
+    mDataFragmentReadPos = 0u;
+    return fetch_data();
   }
+  return seastar::make_ready_future<>();
 }
 
 bool

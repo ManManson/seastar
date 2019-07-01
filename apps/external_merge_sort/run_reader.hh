@@ -46,6 +46,6 @@ public:
   DataFragment data_fragment();
 
   const record_underlying_type* current_record_in_fragment() const;
-  void advance_record_in_fragment();
+  seastar::future<> advance_record_in_fragment();
   bool has_more() const;
 };
