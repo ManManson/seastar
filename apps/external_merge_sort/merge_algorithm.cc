@@ -85,10 +85,10 @@ MergeAlgorithm::merge()
     .wait();
 }
 
-MergeAlgorithm::TempBufferWriter::TempBufferWriter(seastar::file& out,
+MergeAlgorithm::TempBufferWriter::TempBufferWriter(seastar::file out,
                                                    unsigned lvl,
                                                    unsigned run_id)
-  : mOutputFile(out)
+  : mOutputFile(std::move(out))
   , mBuf(OUT_BUF_SIZE)
   , mLvl(lvl)
   , mRunId(run_id)
@@ -152,7 +152,7 @@ MergeAlgorithm::merge_pass(unsigned lvl,
                              seastar::open_flags::wo)
       .get0();
 
-  TempBufferWriter buf_writer(output_file, lvl, current_run_id);
+  TempBufferWriter buf_writer(std::move(output_file), lvl, current_run_id);
 
   // create a reader for each assigned id
   seastar::do_for_each(
@@ -214,33 +214,35 @@ MergeAlgorithm::merge_pass(unsigned lvl,
           buf_writer.write().wait();
       });
     })
-    .wait();
+    .then([&run_readers, &buf_writer] {
+      return seastar::async([&run_readers, &buf_writer] {
+        // write back to file if there is anything left in the last reader
+        auto const& last_reader = run_readers.front();
+        DataFragment const last_fragment = last_reader->data_fragment();
+        record_underlying_type const
+          *remaining_recs_ptr = last_reader->current_record_in_fragment(),
+          *fragment_end = last_fragment.mBeginPtr + last_fragment.mDataSize;
 
-  // write back to file if there is anything left in the last reader
-  auto const& last_reader = run_readers.front();
-  DataFragment const last_fragment = last_reader->data_fragment();
-  record_underlying_type const *remaining_recs_ptr =
-                                 last_reader->current_record_in_fragment(),
-                               *fragment_end = last_fragment.mBeginPtr +
-                                               last_fragment.mDataSize;
+        seastar::do_until(
+          [&remaining_recs_ptr, fragment_end] {
+            return remaining_recs_ptr == fragment_end;
+          },
+          [&buf_writer, &remaining_recs_ptr] {
+            buf_writer.append_record(remaining_recs_ptr);
+            remaining_recs_ptr += RECORD_SIZE;
+            if (buf_writer.is_full())
+              return buf_writer.write();
+            return seastar::make_ready_future<>();
+          })
+          .then([&buf_writer] {
+            if (!buf_writer.is_empty())
+              return buf_writer.write();
+            return seastar::make_ready_future<>();
+          })
+          .wait();
 
-  seastar::do_until(
-    [&remaining_recs_ptr, fragment_end] {
-      return remaining_recs_ptr == fragment_end;
-    },
-    [&buf_writer, &remaining_recs_ptr] {
-      buf_writer.append_record(remaining_recs_ptr);
-      remaining_recs_ptr += RECORD_SIZE;
-      if (buf_writer.is_full())
-        return buf_writer.write();
-      return seastar::make_ready_future<>();
+        last_reader->remove_run_file().wait();
+      });
     })
     .wait();
-
-  if (!buf_writer.is_empty()) {
-    buf_writer.write().wait();
-  }
-  last_reader->remove_run_file().wait();
-
-  output_file.close().wait();
 }

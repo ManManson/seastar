@@ -59,7 +59,7 @@ private:
       align_to_record_size(32u * seastar::MB);
 
     // output file handle to be populated from the internal buffer
-    seastar::file& mOutputFile;
+    seastar::file mOutputFile;
     // temporary buffer to support chunked output to the file
     seastar::temporary_buffer<record_underlying_type> mBuf;
     // current merging pass level and run id for logging
@@ -71,7 +71,7 @@ private:
     uint64_t mBufWritePos;
 
   public:
-    TempBufferWriter(seastar::file& out, unsigned lvl, unsigned run_id);
+    TempBufferWriter(seastar::file out, unsigned lvl, unsigned run_id);
 
     seastar::future<> write();
 
