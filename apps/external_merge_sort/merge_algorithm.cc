@@ -271,40 +271,38 @@ MergePass::execute(unsigned lvl,
                            });
                        })
                 .then([this, &run_readers, &buf_writer] {
-                  return seastar::async([this, &run_readers, &buf_writer] {
-                    // pop the remaining element from the queue since we are
-                    // going to flush the data in the last reader directly
-                    mPq.pop();
+                  // pop the remaining element from the queue since we are
+                  // going to flush the data in the last reader directly
+                  mPq.pop();
 
-                    auto const& last_reader = run_readers.front();
-                    DataFragment const last_fragment =
-                      last_reader->data_fragment();
-                    record_underlying_type const
-                      *remaining_recs_ptr =
-                        last_reader->current_record_in_fragment(),
-                      *fragment_end =
-                        last_fragment.mBeginPtr + last_fragment.mDataSize;
+                  auto const& last_reader = run_readers.front();
+                  DataFragment const last_fragment =
+                    last_reader->data_fragment();
+                  record_underlying_type const
+                    *remaining_recs_ptr =
+                      last_reader->current_record_in_fragment(),
+                    *fragment_end =
+                      last_fragment.mBeginPtr + last_fragment.mDataSize;
 
-                    seastar::do_until(
-                      [&remaining_recs_ptr, fragment_end] {
-                        return remaining_recs_ptr == fragment_end;
-                      },
-                      [&buf_writer, &remaining_recs_ptr] {
-                        buf_writer.append_record(remaining_recs_ptr);
-                        remaining_recs_ptr += RECORD_SIZE;
-                        if (buf_writer.is_full())
-                          return buf_writer.write();
-                        return seastar::make_ready_future<>();
-                      })
-                      .then([&buf_writer] {
-                        if (!buf_writer.is_empty())
-                          return buf_writer.write();
-                        return seastar::make_ready_future<>();
-                      })
-                      .wait();
-
-                    last_reader->remove_run_file().wait();
-                  });
+                  return seastar::do_until(
+                           [&remaining_recs_ptr, fragment_end] {
+                             return remaining_recs_ptr == fragment_end;
+                           },
+                           [&buf_writer, &remaining_recs_ptr] {
+                             buf_writer.append_record(remaining_recs_ptr);
+                             remaining_recs_ptr += RECORD_SIZE;
+                             if (buf_writer.is_full())
+                               return buf_writer.write();
+                             return seastar::make_ready_future<>();
+                           })
+                    .then([&buf_writer] {
+                      if (!buf_writer.is_empty())
+                        return buf_writer.write();
+                      return seastar::make_ready_future<>();
+                    })
+                    .then([&run_readers] {
+                      return run_readers.front()->remove_run_file();
+                    });
                 });
             });
         });
