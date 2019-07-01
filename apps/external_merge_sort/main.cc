@@ -125,12 +125,9 @@ main(int argc, char** argv)
         .then([&, temp_path] {
           return seastar::async([&, temp_path = std::move(temp_path)] {
             // invoke K-way merge sorting algorithm
-            MergeAlgorithm malgo(init_run_srv.local().total_run_count(),
-                                 input_size,
-                                 aligned_cpu_mem,
-                                 output_filepath,
-                                 temp_path);
-            malgo.merge();
+            MergeAlgorithm malgo(input_size, output_filepath, temp_path);
+            malgo.merge(aligned_cpu_mem,
+                        init_run_srv.local().total_run_count());
           });
         })
         .wait();
