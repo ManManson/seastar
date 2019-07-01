@@ -19,10 +19,10 @@ class future;
 class DataFragment;
 
 ///
-/// \brief The RunReaderService class
+/// \brief The RunReader class
 /// Manages opening, disposing, reading and fetching portions of data from a run
 ///
-class RunReaderService
+class RunReader
 {
   seastar::file mFd;
   seastar::sstring mFilePath;
@@ -34,7 +34,7 @@ class RunReaderService
   uint64_t mDataFragmentReadPos = 0u;
 
 public:
-  RunReaderService(std::size_t mem);
+  RunReader(std::size_t mem);
 
   seastar::future<> stop();
 

@@ -2,15 +2,15 @@
 #include <seastar/core/reactor.hh>
 
 #include "data_fragment.hh"
-#include "run_reader_service.hh"
+#include "run_reader.hh"
 #include "utils.hh"
 
-RunReaderService::RunReaderService(std::size_t mem)
+RunReader::RunReader(std::size_t mem)
   : mAlignedCpuMemSize(mem) // aligned to be a multiple of `RECORD_SIZE`
 {}
 
 seastar::future<>
-RunReaderService::stop()
+RunReader::stop()
 {
   if (mFd)
     return mFd.close();
@@ -18,7 +18,7 @@ RunReaderService::stop()
 }
 
 seastar::future<>
-RunReaderService::set_run_fd(seastar::sstring filepath, seastar::file fd)
+RunReader::set_run_fd(seastar::sstring filepath, seastar::file fd)
 {
   mFd = std::move(fd);
   mFilePath = std::move(filepath);
@@ -27,7 +27,7 @@ RunReaderService::set_run_fd(seastar::sstring filepath, seastar::file fd)
 }
 
 seastar::future<>
-RunReaderService::open_run_file(seastar::sstring path)
+RunReader::open_run_file(seastar::sstring path)
 {
   return seastar::do_with(std::move(path), [&](auto& path) {
     return seastar::open_file_dma(path, seastar::open_flags::ro)
@@ -38,7 +38,7 @@ RunReaderService::open_run_file(seastar::sstring path)
 }
 
 seastar::future<>
-RunReaderService::remove_run_file()
+RunReader::remove_run_file()
 {
   task_logger.info("removing file \"{}\"", mFilePath);
   return mFd.close()
@@ -47,7 +47,7 @@ RunReaderService::remove_run_file()
 }
 
 seastar::future<>
-RunReaderService::fetch_data()
+RunReader::fetch_data()
 {
   return mFd
     .dma_read<record_underlying_type>(mCurrentReadPos, mAlignedCpuMemSize)
@@ -60,18 +60,18 @@ RunReaderService::fetch_data()
 }
 
 DataFragment
-RunReaderService::data_fragment()
+RunReader::data_fragment()
 {
   return DataFragment{ mBuf.get(), mActualBufSize };
 }
 const record_underlying_type*
-RunReaderService::current_record_in_fragment() const
+RunReader::current_record_in_fragment() const
 {
   return mBuf.get() + mDataFragmentReadPos;
 }
 
 void
-RunReaderService::advance_record_in_fragment()
+RunReader::advance_record_in_fragment()
 {
   mDataFragmentReadPos += RECORD_SIZE;
   if (mDataFragmentReadPos == mActualBufSize) {
@@ -80,7 +80,7 @@ RunReaderService::advance_record_in_fragment()
 }
 
 bool
-RunReaderService::has_more() const
+RunReader::has_more() const
 {
   return mActualBufSize != 0u;
 }

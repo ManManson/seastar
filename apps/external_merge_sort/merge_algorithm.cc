@@ -5,7 +5,7 @@
 
 #include "data_fragment.hh"
 #include "merge_algorithm.hh"
-#include "run_reader_service.hh"
+#include "run_reader.hh"
 #include "utils.hh"
 
 MergeAlgorithm::MergeAlgorithm(std::size_t input_file_size,
@@ -179,7 +179,7 @@ MergePass::execute(unsigned lvl,
                    unsigned current_run_id,
                    std::vector<unsigned> assigned_ids)
 {
-  std::vector<seastar::lw_shared_ptr<RunReaderService>> run_readers;
+  std::vector<seastar::lw_shared_ptr<RunReader>> run_readers;
   run_readers.reserve(assigned_ids.size());
 
   TempBufferWriter buf_writer(lvl, current_run_id);
@@ -208,7 +208,7 @@ MergePass::execute(unsigned lvl,
                        run_id,
                        run_lvl);
 
-                     auto r = seastar::make_lw_shared<RunReaderService>(
+                     auto r = seastar::make_lw_shared<RunReader>(
                        align_to_record_size(mPerCpuMemory / mK));
 
                      return seastar::do_with(

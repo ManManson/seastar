@@ -19,7 +19,6 @@
 #include "initial_run_service.hh"
 #include "merge_algorithm.hh"
 #include "record_comparators.hh"
-#include "run_reader_service.hh"
 #include "utils.hh"
 
 namespace bpo = boost::program_options;

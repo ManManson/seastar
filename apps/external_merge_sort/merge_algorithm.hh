@@ -20,7 +20,7 @@ template<typename... T>
 class future;
 } // namespace seastar
 
-class RunReaderService;
+class RunReader;
 class DataFragment;
 
 class MergeAlgorithm

@@ -17,10 +17,10 @@ struct record_compare
                   record_underlying_type const* rhs) const;
 };
 
-class RunReaderService;
+class RunReader;
 
 using priorq_element = std::pair<record_underlying_type const*,
-                                 seastar::lw_shared_ptr<RunReaderService>>;
+                                 seastar::lw_shared_ptr<RunReader>>;
 
 struct inverse_record_compare
 {

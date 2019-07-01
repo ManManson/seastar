@@ -1,7 +1,7 @@
 #include <seastar/core/shared_ptr.hh>
 
 #include "record_comparators.hh"
-#include "run_reader_service.hh"
+#include "run_reader.hh"
 
 bool
 record_compare::operator()(record_underlying_type const* lhs,
