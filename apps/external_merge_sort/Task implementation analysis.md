@@ -67,9 +67,11 @@ rename last generated temporary partition into final output file name
 Each merge pass manages `K` run readers. We are bounded by `per_cpu_memory` limit per core.
 So each reader should occupy at most `per_cpu_memory / K` fraction of the shard memory.
 
-On the one hand we want to minimize overall levels count. On the other hand we don't want to have *too* small buffers and an enormous count of readers per merge pass.
+On the one hand we want to minimize overall levels count.
+On the other hand we don't want to have *too* small buffers and an enormous count of readers per merge pass.
 
-So by default we put `K = <number of initial runs>` but also check if the buffers for the individual readers are not getting small (define this threshold as 4MiB).
+So by default we put `K = <number of initial runs>` but also check if the buffers
+for the individual readers are not getting small (define this threshold as 4MiB).
 ```
 
 Each core executes a single merge pass operation which merges K files from the previous level into the single larger file. 
@@ -104,7 +106,7 @@ The sorting is implemented via `std::priority_queue` which is a `max heap` struc
 
 One of the main advantages of using the `std::priority_queue` is that it allows insertion and min element retrieval to have at most logarithmic complexity.
 
-The data is at first being written to a temporary output buffer of size '32MB', which is flushed to the output file every time the buffer gets filled.
+The data is at first being written to a temporary output buffer of size `32MB`, which is flushed to the output file every time the buffer gets filled.
 
 Buffer size is made small for the same reasons as in the first phase:
 
@@ -131,11 +133,11 @@ There we again group the issues by the algorithm phase.
 
 ### Some more generic issues
 
-This implementation extensively uses temporary files to store initial runs and intermediate merge runs. Worst-case space overhead, in this case, is `InputSize * 2` (on the last merge pass we have one last output partition that would be of `InputSize` size and `K` partitions which have a total size of `InputSize` bytes too).
+* This implementation extensively uses temporary files to store initial runs and intermediate merge runs. Worst-case space overhead, in this case, is `InputSize * 2` (on the last merge pass we have one last output partition that would be of `InputSize` size and `K` partitions which have a total size of `InputSize` bytes too).
 We could avoid creating temporary files and use rewriting output file `in-place`.
 
-Exception handling is poor, at least it should be checked that all reads and writes are secured in terms of error reporting.
+* Exception handling is poor, at least it should be checked that all reads and writes are secured in terms of error reporting.
 
-The code uses `seastar::async` paired with a series of `.wait()` at some places. It potentially limits the code parallelization degree. Also, it forces to manually invoke `seastar::thread::yield` to yield to reactor event loop for a while. So, all `while` and `for` (plus `seastar::async`) uses should be replaced with Seastar primitives like `seastar::do_until/seastar::do_for_each`. Explicit `wait()`s should be replaced with continuation chains.
+* The code uses `seastar::async` paired with a series of `.wait()` at some places. It potentially limits the code parallelization degree. Also, it forces to manually invoke `seastar::thread::yield` to yield to reactor event loop for a while. So, all `while` and `for` (plus `seastar::async`) uses should be replaced with Seastar primitives like `seastar::do_until/seastar::do_for_each`. Explicit `wait()`s should be replaced with continuation chains.
 
-It would be nice to have CMake unit tests for the solution.
+* It would be nice to have CMake unit tests for the solution.
