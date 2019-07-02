@@ -79,6 +79,11 @@ public:
   bool is_empty() const;
 };
 
+///
+/// \brief The MergePass class
+/// Manages execution of a single operation that involves merging K files into a
+/// new one (sorted).
+///
 class MergePass
 {
 private:
@@ -100,4 +105,13 @@ public:
   seastar::future<> execute(unsigned lvl,
                             unsigned current_run_id,
                             std::vector<unsigned> assigned_ids);
+
+private:
+  seastar::future<> merge_step(
+    TempBufferWriter& buf_writer,
+    std::vector<seastar::lw_shared_ptr<RunReader>>& run_readers);
+
+  seastar::future<> finalize_merge(
+    TempBufferWriter& buf_writer,
+    std::vector<seastar::lw_shared_ptr<RunReader>>& run_readers);
 };

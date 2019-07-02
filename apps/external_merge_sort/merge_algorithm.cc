@@ -20,16 +20,24 @@ MergeAlgorithm::MergeAlgorithm(std::size_t input_file_size,
 void
 MergeAlgorithm::merge(std::size_t per_cpu_memory, unsigned initial_run_count)
 {
-  // calculate K-way merge sort constant
-  // at first try mInitialRunCount, but check if (mPerCpuMemory / K) is >= 4MiB.
-  // If so, take mInitialRunCount, else calculate K in a way that ensures that
-  // (mPerCpuMemory / K) == 4MiB equals to 4MiB
-
-  //  unsigned K = initial_run_count;
-  //  if (align_to_record_size(per_cpu_memory / K) < 4u * seastar::MB) {
-  //    K = align_to_record_size(per_cpu_memory / (4u * seastar::MB));
-  //  }
-  unsigned K = 31; // 16
+  // Try to calculate optimal K constant for the K-way merge sort algorithm.
+  //
+  // Each MergePass instance manages K run readers. We are bounded by
+  // `per_cpu_memory` limit per core. So each reader should occupy at most
+  // `per_cpu_memory / K` fraction of the shard memory.
+  //
+  // On the one hand we want to minimize overall levels count. On the other hand
+  // we don't want to have *too* small buffers and an enormous count of readers
+  // per merge pass. So by default we put `K = <number of initial runs>` but
+  // also check if the buffers for the individual readers are not getting small
+  // (define this threshold as 4MiB).
+  //
+  // TODO: consider adjusting K in such a way that provides every core with
+  // roughly equal amount of work?
+  unsigned K = initial_run_count;
+  if (align_to_record_size(per_cpu_memory / K) < 4u * seastar::MB) {
+    K = align_to_record_size(per_cpu_memory / (4u * seastar::MB));
+  }
 
   // Maximum size of each individual run on the previous level
   std::size_t run_size =
@@ -45,16 +53,13 @@ MergeAlgorithm::merge(std::size_t per_cpu_memory, unsigned initial_run_count)
     task_logger.info("Start merge pass (level {})", lvl);
 
     // assign unprocessed initial run ids
-
     std::queue<uint32_t> unprocessed_ids;
     for (uint32_t i = 0; i != prev_lvl_run_count; ++i) {
       unprocessed_ids.push(i);
     }
 
-    unsigned current_run_id = 0u;
-
     std::vector<seastar::future<>> merge_tasks;
-    unsigned current_cpu_id = 0u;
+    unsigned current_run_id = 0u, current_cpu_id = 0u;
 
     while (!unprocessed_ids.empty()) {
       // take at most K ids from unprocessed list and pass them to the merge
@@ -70,6 +75,8 @@ MergeAlgorithm::merge(std::size_t per_cpu_memory, unsigned initial_run_count)
           break;
       }
 
+      // TODO: limit parallelizm via `with_semaphore` (seastar::smp::count)
+      // to ensure that no core takes more than one merge pass at a time.
       auto task = merge_pass.invoke_on(current_cpu_id, [=](auto& inst) {
         return inst.execute(lvl, current_run_id, assigned_ids);
       });
@@ -86,14 +93,14 @@ MergeAlgorithm::merge(std::size_t per_cpu_memory, unsigned initial_run_count)
       .discard_result()
       .wait();
     ++lvl;
-    // increase each run size by a factor of K = (smp::count - 1)
-    // since it is the constant in K-way merge algorithm
+    // increase each run size by a factor of K (used solely to calculate runs
+    // count from the previous levels)
     run_size *= K;
     run_size = align_to_record_size(run_size);
     prev_lvl_run_count = round_up_int_div(mInputFileSize, run_size);
   }
 
-  // move last produced run to `output_file` destination
+  // move the last produced run to `output_file` destination
   auto last_run_path = run_filename(mTempPath, lvl - 1, 0);
   task_logger.info(
     "Moving the last run file \"{}\" to the final destination \"{}\"",
@@ -191,6 +198,7 @@ MergePass::execute(unsigned lvl,
     std::move(assigned_ids),
     [this, lvl, current_run_id](
       auto& run_readers, auto& buf_writer, auto& assigned_ids) {
+      // open temporary file for the output run
       return seastar::open_file_dma(
                run_filename(mTempPath, lvl, current_run_id),
                seastar::open_flags::create | seastar::open_flags::truncate |
@@ -212,6 +220,7 @@ MergePass::execute(unsigned lvl,
                      auto r = seastar::make_lw_shared<RunReader>(
                        align_to_record_size(mPerCpuMemory / mK));
 
+                     // and fetch some data for each reader
                      return seastar::do_with(
                        std::move(r),
                        [this, &run_readers, run_lvl, run_id](auto& reader_ptr) {
@@ -237,74 +246,90 @@ MergePass::execute(unsigned lvl,
               return seastar::do_until(
                        [&run_readers] { return run_readers.size() <= 1u; },
                        [this, &buf_writer, &run_readers] {
-                         return seastar::async(
-                           [this, &buf_writer, &run_readers] {
-                             auto min_element = mPq.top();
-                             buf_writer.append_record(min_element.first);
-                             // write back to file if the buffer is full
-                             if (buf_writer.is_full())
-                               buf_writer.write().wait();
-
-                             mPq.pop();
-
-                             min_element.second->advance_record_in_fragment()
-                               .wait();
-
-                             if (min_element.second->has_more()) {
-                               mPq.push({ min_element.second
-                                            ->current_record_in_fragment(),
-                                          min_element.second });
-                             } else {
-                               // if reader with `just extracted min element` is
-                               // exhausted
-                               min_element.second->remove_run_file().wait();
-
-                               auto reader_to_erase = std::find_if(
-                                 run_readers.begin(),
-                                 run_readers.end(),
-                                 [v = min_element.second.get()](auto const& x) {
-                                   return x.get() == v;
-                                 });
-                               // exclude it from the processing list
-                               run_readers.erase(reader_to_erase);
-                             }
-                           });
+                         // extract values one by one from each reader and
+                         // append to the buf_writer until there is just one
+                         // reader left
+                         return merge_step(buf_writer, run_readers);
                        })
-                .then([this, &run_readers, &buf_writer] {
-                  // pop the remaining element from the queue since we are
-                  // going to flush the data in the last reader directly
-                  mPq.pop();
-
-                  auto const& last_reader = run_readers.front();
-                  DataFragment const last_fragment =
-                    last_reader->data_fragment();
-                  record_underlying_type const
-                    *remaining_recs_ptr =
-                      last_reader->current_record_in_fragment(),
-                    *fragment_end =
-                      last_fragment.mBeginPtr + last_fragment.mDataSize;
-
-                  return seastar::do_until(
-                           [&remaining_recs_ptr, fragment_end] {
-                             return remaining_recs_ptr == fragment_end;
-                           },
-                           [&buf_writer, &remaining_recs_ptr] {
-                             buf_writer.append_record(remaining_recs_ptr);
-                             remaining_recs_ptr += RECORD_SIZE;
-                             if (buf_writer.is_full())
-                               return buf_writer.write();
-                             return seastar::make_ready_future<>();
-                           })
-                    .then([&buf_writer] {
-                      if (!buf_writer.is_empty())
-                        return buf_writer.write();
-                      return seastar::make_ready_future<>();
-                    })
-                    .then([&run_readers] {
-                      return run_readers.front()->remove_run_file();
-                    });
+                .then([this, &buf_writer, &run_readers] {
+                  // flush remaining elements in the last reader from the local
+                  // buffer to the output file
+                  return finalize_merge(buf_writer, run_readers);
                 });
             });
         });
     });
+}
+
+seastar::future<>
+MergePass::merge_step(
+  TempBufferWriter& buf_writer,
+  std::vector<seastar::lw_shared_ptr<RunReader>>& run_readers)
+{
+  return seastar::async([this, &buf_writer, &run_readers] {
+    // extract min element from the pq, and write it to
+    // the buffer
+    auto min_element = mPq.top();
+    buf_writer.append_record(min_element.first);
+    // write back to file if the buffer is full
+    if (buf_writer.is_full())
+      buf_writer.write().wait();
+
+    mPq.pop();
+
+    min_element.second->advance_record_in_fragment().wait();
+
+    if (min_element.second->has_more()) {
+      // refill pq with the new value from the reader
+      // associated with the "previous" min element
+      mPq.push({ min_element.second->current_record_in_fragment(),
+                 min_element.second });
+    } else {
+      // if the reader associated with "previous" min
+      // element is exhausted, remove its run file and
+      // erase from the `run_readers` processing list
+      min_element.second->remove_run_file().wait();
+
+      auto reader_to_erase = std::find_if(
+        run_readers.begin(),
+        run_readers.end(),
+        [v = min_element.second.get()](auto const& x) { return x.get() == v; });
+      run_readers.erase(reader_to_erase);
+    }
+  });
+}
+
+seastar::future<>
+MergePass::finalize_merge(
+  TempBufferWriter& buf_writer,
+  std::vector<seastar::lw_shared_ptr<RunReader>>& run_readers)
+{
+  // pop the remaining element from the queue since we are
+  // going to flush the data in the last reader directly
+  mPq.pop();
+
+  auto const& last_reader = run_readers.front();
+  DataFragment const last_fragment = last_reader->data_fragment();
+  record_underlying_type const *remaining_recs_ptr =
+                                 last_reader->current_record_in_fragment(),
+                               *fragment_end = last_fragment.mBeginPtr +
+                                               last_fragment.mDataSize;
+
+  return seastar::do_until(
+           [&remaining_recs_ptr, fragment_end] {
+             return remaining_recs_ptr == fragment_end;
+           },
+           [&buf_writer, &remaining_recs_ptr] {
+             buf_writer.append_record(remaining_recs_ptr);
+             remaining_recs_ptr += RECORD_SIZE;
+             if (buf_writer.is_full())
+               return buf_writer.write();
+             return seastar::make_ready_future<>();
+           })
+    .then([&buf_writer] {
+      if (!buf_writer.is_empty())
+        return buf_writer.write();
+      return seastar::make_ready_future<>();
+    })
+    .then([&run_readers] { return run_readers.front()->remove_run_file(); });
 }
