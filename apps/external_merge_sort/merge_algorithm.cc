@@ -309,16 +309,20 @@ MergePass::finalize_merge(
                                *fragment_end = last_fragment.mBeginPtr +
                                                last_fragment.mDataSize;
 
-  return seastar::do_until(
-           [&remaining_recs_ptr, fragment_end] {
-             return remaining_recs_ptr == fragment_end;
-           },
-           [&buf_writer, &remaining_recs_ptr] {
-             buf_writer.append_record(remaining_recs_ptr);
-             remaining_recs_ptr += RECORD_SIZE;
-             if (buf_writer.is_full())
-               return buf_writer.write();
-             return seastar::make_ready_future<>();
+  return seastar::do_with(
+           std::move(remaining_recs_ptr),
+           [&buf_writer, &run_readers, fragment_end](auto& remaining_recs_ptr) {
+             return seastar::do_until(
+               [&remaining_recs_ptr, fragment_end] {
+                 return remaining_recs_ptr == fragment_end;
+               },
+               [&buf_writer, &remaining_recs_ptr] {
+                 buf_writer.append_record(remaining_recs_ptr);
+                 remaining_recs_ptr += RECORD_SIZE;
+                 if (buf_writer.is_full())
+                   return buf_writer.write();
+                 return seastar::make_ready_future<>();
+               });
            })
     .then([&buf_writer] {
       if (!buf_writer.is_empty())
