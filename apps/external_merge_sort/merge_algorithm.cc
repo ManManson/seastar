@@ -52,30 +52,24 @@ MergeAlgorithm::merge(std::size_t per_cpu_memory, unsigned initial_run_count)
   while (prev_lvl_run_count > 1) {
     task_logger.info("Start merge pass (level {})", lvl);
 
-    // assign unprocessed initial run ids
-    std::queue<uint32_t> unprocessed_ids;
-    for (uint32_t i = 0; i != prev_lvl_run_count; ++i) {
-      unprocessed_ids.push(i);
-    }
+    uint32_t prev_lvl_id = 0u;
 
     std::vector<seastar::future<>> merge_tasks;
     unsigned current_run_id = 0u, current_cpu_id = 0u;
 
-    while (!unprocessed_ids.empty()) {
-      // take at most K ids from unprocessed list and pass them to the merge
-      // pass in the case where < K ids are available, utilize only a fraction
-      // of CPUs accordingly
+    while (prev_lvl_id != prev_lvl_run_count) {
+      // calculate run ids span for each merge pass to operate on
+      unsigned last_id_to_assign =
+        prev_lvl_id + K < prev_lvl_run_count ? K : prev_lvl_run_count;
+      auto id_span = boost::irange<unsigned>(prev_lvl_id, last_id_to_assign);
+
       std::vector<uint32_t> assigned_ids;
       assigned_ids.reserve(K);
-      for (uint32_t i = 0u; i != K; ++i) {
-        uint32_t id = unprocessed_ids.front();
-        assigned_ids.push_back(id);
-        unprocessed_ids.pop();
-        if (unprocessed_ids.empty())
-          break;
-      }
+      assigned_ids.assign(id_span.begin(), id_span.end());
 
-      // TODO: limit parallelizm via `with_semaphore` (seastar::smp::count)
+      prev_lvl_id = last_id_to_assign;
+
+      // TODO: limit parallelism via `with_semaphore` (seastar::smp::count)
       // to ensure that no core takes more than one merge pass at a time.
       auto task = merge_pass.invoke_on(current_cpu_id, [=](auto& inst) {
         return inst.execute(lvl, current_run_id, assigned_ids);
